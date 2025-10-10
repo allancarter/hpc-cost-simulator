@@ -490,7 +490,7 @@ class LSFLogParser(SchedulerLogParser):
         if fields:
             extra_fields = "'" + ','.join(fields) + "'"
             msg = f"{len(fields)} extra fields left over: {extra_fields}"
-            if lsf_version >= parse_version('10.11') and len(fields) == 3:
+            if lsf_version >= parse_version('10.11') and len(fields) in [3, 5]:
                 logger.debug(msg)
             else:
                 raise ValueError(msg)
