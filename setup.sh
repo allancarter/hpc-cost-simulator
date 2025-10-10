@@ -18,6 +18,8 @@ elif [ -e /etc/os-release ]; then
         export distribution=CentOS
     elif [ $ID == "rhel" ]; then
         export distribution=RedHat
+    elif [ $ID == "rocky" ]; then
+        export distribution=Rocky
     else
         echo -e "\nerror: Unsupported OS distribution $ID"
         return 1
