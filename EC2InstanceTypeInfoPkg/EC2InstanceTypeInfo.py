@@ -18,7 +18,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, NoCredentialsError
 import csv
 from datetime import datetime
 from EC2InstanceTypeInfoPkg.get_savings_plans import SavingsPlanInfo
@@ -56,13 +56,21 @@ class EC2InstanceTypeInfo:
         # If they don't exist, then require json_filename with cached results.
         self.valid_credentials = False
         self.valid_regions = []
-        self.ec2_client = boto3.client('ec2', region_name='us-east-1')
+        try:
+            self.ec2_client = boto3.client('ec2', region_name='us-east-1')
+        except Exception as e:
+            logger.debug(f"Failed to get boto3 client: {e}")
+            self.ec2_client = None
+
         try:
             self.valid_regions = sorted([region["RegionName"] for region in self.describe_regions()["Regions"]])
             self.valid_credentials = True
+        except NoCredentialsError as e:
+            logger.debug(f"Failed to get valid regions: {e}")
         except ClientError as e:
             logger.debug(f"{e.response['Error']['Message']}({e.response['Error']['Code']})")
-            logger.info(f"Valid AWS CLI credentials not found. Must specify json_filename or configure or update your AWS CLI credentials.")
+        except Exception as e:
+            logger.debug(f"Failed to get valid regions: {e}")
 
         # Valid credentials shouldn't be required.
         # If they don't exist, then require json_filename with cached results.
