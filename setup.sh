@@ -26,6 +26,16 @@ elif [ -e /etc/os-release ]; then
     fi
     export distribution_version=$VERSION_ID
     export distribution_major_version=$(echo $distribution_version | cut -d '.' -f 1)
+elif [ -e /etc/redhat-release ]; then
+    # Fallback for older systems without /etc/os-release (like CentOS 6)
+    if grep -q "CentOS release 6" /etc/redhat-release; then
+        export distribution=CentOS
+        export distribution_version="6"
+        export distribution_major_version="6"
+    else
+        echo -e "\nerror: Could not detect the OS distribution."
+        return 1
+    fi
 else
     echo -e "\nerror: Could not detect the OS distribution."
     return 1
