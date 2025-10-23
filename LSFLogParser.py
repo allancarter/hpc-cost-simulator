@@ -540,15 +540,15 @@ def main() -> None:
         lsfLogParser.parse_jobs()
     except Exception as e:
         logger.exception('parse_jobs failed')
-        logger.info(f"{lsfLogParser._num_input_jobs} jobs parsed")
+        logger.info(f"{lsfLogParser._num_input_jobs:,} jobs parsed")
         if args.output_csv:
-            logger.info(f"{lsfLogParser._num_output_jobs} jobs written to {args.output_csv}")
+            logger.info(f"{lsfLogParser._num_output_jobs:,} jobs written to {args.output_csv}")
         logger.error(f"Failed")
         exit(1)
 
-    logger.info(f"{lsfLogParser._num_input_jobs} jobs parsed")
+    logger.info(f"{lsfLogParser._num_input_jobs:} jobs parsed")
     if args.output_csv:
-        logger.info(f"{lsfLogParser._num_output_jobs} jobs written to {args.output_csv}")
+        logger.info(f"{lsfLogParser._num_output_jobs:,} jobs written to {args.output_csv}")
     if lsfLogParser._invalid_record_dict:
         logger.error(f"Failed")
         exit(1)

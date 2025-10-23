@@ -251,7 +251,7 @@ class JobAnalyzer(JobAnalyzerBase):
                         self._update_hourly_stats(round_hour, instance_minutes, runtime_minutes, core_hours, total_hourly_rate, spot_eligible, instance_family)
                         round_hour += 1
                         round_hour_seconds = round_hour * SECONDS_PER_HOUR
-            logger.debug(f"    Finished processing ({num_jobs} jobs)")
+            logger.debug(f"    Finished processing ({num_jobs:,} jobs)")
 	        # Print a progress message for every 24 hours of data
             if hourly_file_index and (hourly_file_index % 24 == 0):
                 memory = psutil.virtual_memory()
@@ -1242,8 +1242,8 @@ class JobAnalyzer(JobAnalyzerBase):
             self._add_job_to_hourly_bucket(job_cost_data)
             if (total_jobs % 10000) == 0:
                 memory = psutil.virtual_memory()
-                logger.info(f"    Parsed {total_jobs} jobs. mem used: {memory.used}/{memory.total}={int(memory.used/memory.total*100)}%")
-        logger.info(f"Finished processing {total_jobs-total_failed_jobs}/{total_jobs} jobs")
+                logger.info(f"    Parsed {total_jobs:,} jobs. mem used: {memory.used:,}/{memory.total:,} = {int(memory.used/memory.total*100)}%")
+        logger.info(f"Finished processing {total_jobs-total_failed_jobs:,}/{total_jobs:,} jobs")
 
         # Dump pending jobs and summary to output files
         self._write_hourly_jobs_buckets_to_file()
