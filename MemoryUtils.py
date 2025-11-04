@@ -21,6 +21,7 @@ MEM_MB = MEM_KB*1024
 MEM_GB = MEM_MB*1024
 MEM_TB = MEM_GB*1024
 MEM_PB = MEM_TB*1024
+MEM_EB = MEM_PB*1024
 
 MEM_SUFFIX = {
     'K': MEM_KB,
@@ -28,6 +29,7 @@ MEM_SUFFIX = {
     'G': MEM_GB,
     'T': MEM_TB,
     'P': MEM_PB,
+    'E': MEM_EB,
 }
 
 def mem_string_to_float(string_value: str) -> float:

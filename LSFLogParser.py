@@ -17,7 +17,7 @@ import csv
 import json
 import logging
 from LSB_ACCT_FIELDS import LSB_ACCT_RECORD_FORMATS, MINIMAL_LSB_ACCT_FIELDS
-from MemoryUtils import MEM_GB, MEM_KB, MEM_MB
+from MemoryUtils import MEM_GB, MEM_KB, MEM_MB, MEM_TB, MEM_PB, MEM_EB
 from os import listdir, path
 from os.path import basename, dirname, realpath
 from packaging.version import parse as parse_version
@@ -40,7 +40,7 @@ class LSFLogParser(SchedulerLogParser):
     Parse LSF bacct.lsb* files to get job completion information.
     '''
 
-    def __init__(self, logfile_dir: str, output_csv: str, default_max_mem_gb: float, starttime: str=None, endtime: str=None):
+    def __init__(self, logfile_dir: str, output_csv: str, default_max_mem_gb: float, unit_for_limits: str='MB', starttime: str=None, endtime: str=None):
         '''
         Constructor
 
@@ -50,12 +50,26 @@ class LSFLogParser(SchedulerLogParser):
                 Directory where output will be written.
                 Will be created if it doesn't already exist.
             output_csv (str): CSV file where parsed jobs will be written.
+            default_max_mem_gb (float): Default maximum memory for a job in GB.
+            unit_for_limits (str): Unit for job memory limits (KB, MB, GB, TB, PB, EB)
             starttime (str): Select jobs after the specified time
             endtime (str): Select jobs after the specified time
         '''
         super().__init__(None, output_csv, starttime, endtime)
         self._logfile_dir = logfile_dir
         self._default_max_mem_gb = default_max_mem_gb
+
+        # Create mapping from unit string to memory constant
+        self._unit_to_bytes = {
+            'KB': MEM_KB,
+            'MB': MEM_MB,
+            'GB': MEM_GB,
+            'TB': MEM_TB,
+            'PB': MEM_PB,
+            'EB': MEM_EB,
+        }
+        self._unit_for_limits = unit_for_limits
+        self._mem_unit_multiplier = self._unit_to_bytes[unit_for_limits]
 
         self._lsb_acct_files = self._get_lsb_acct_files(logfile_dir)
         self._lsb_acct_filename = None
@@ -169,7 +183,7 @@ class LSFLogParser(SchedulerLogParser):
                 match = re.search(r'mem=([0-9\.]+)', rusage)
                 if match:
                     max_mem = float(match.groups(0)[0])
-                    max_mem_gb = (max_mem * MEM_KB) / MEM_GB
+                    max_mem_gb = (max_mem * self._mem_unit_multiplier) / MEM_GB
                     logger.debug(f"max_mem_gb: {max_mem_gb}")
                 else:
                     logger.debug(f"No memory request found in rusage")
@@ -516,6 +530,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Parse LSF logs.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--logfile-dir", required=True, help="LSF logfile directory")
     parser.add_argument("--output-csv", required=True, help="CSV file with parsed job completion records")
+    parser.add_argument("--unit-for-limits", type=str, default='MB', required=False, choices=['KB', 'MB', 'GB', 'TB', 'PB', 'EB'], help="Unit for job memory limits.  Default is MB. Options: KB, MB, GB, TB, PB, EB")
     parser.add_argument("--default-max-mem-gb", type=float, default=0.0, required=False, help="Default maximum memory for a job in GB.")
     parser.add_argument("--starttime", help="Select jobs after the specified time. Format YYYY-MM-DDTHH:MM:SS")
     parser.add_argument("--endtime", help="Select jobs before the specified time. Format YYYY-MM-DDTHH:MM:SS")
@@ -535,7 +550,7 @@ def main() -> None:
     logger.info('Started LSF log parser')
     logger.info(f"LSF logfile directory: {args.logfile_dir}")
 
-    lsfLogParser = LSFLogParser(args.logfile_dir, args.output_csv, args.default_max_mem_gb, starttime=args.starttime, endtime=args.endtime)
+    lsfLogParser = LSFLogParser(args.logfile_dir, args.output_csv, args.default_max_mem_gb, unit_for_limits=args.unit_for_limits, starttime=args.starttime, endtime=args.endtime)
     try:
         lsfLogParser.parse_jobs()
     except Exception as e:
