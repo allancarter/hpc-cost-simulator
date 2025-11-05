@@ -40,17 +40,12 @@ import psutil
 import re
 from SchedulerJobInfo import logger as SchedulerJobInfo_logger, SchedulerJobInfo, datetime_to_str, str_to_datetime, timestamp_to_datetime
 from SchedulerLogParser import SchedulerLogParser, logger as SchedulerLogParser_logger
+from shared_logger import get_logger, add_file_handler
 from SlurmLogParser import SlurmLogParser, logger as SlurmLogParser_logger
 from sys import exit
 from VersionCheck import logger as VersionCheck_logger, VersionCheck
 
-logger = logging.getLogger(__file__)
-logger_formatter = logging.Formatter('%(levelname)s:%(asctime)s: %(message)s')
-logger_streamHandler = logging.StreamHandler()
-logger_streamHandler.setFormatter(logger_formatter)
-logger.addHandler(logger_streamHandler)
-logger.propagate = False
-logger.setLevel(logging.INFO)
+logger = get_logger()
 
 class JobCost:
     def __init__(self, job: SchedulerJobInfo, spot: bool, instance_family: str, instance_type: str, rate: float):
@@ -687,6 +682,7 @@ class JobAnalyzer(JobAnalyzerBase):
         excel_job_stats_ws.cell(row=row, column=1).value = 'Total job count'
         cell = excel_job_stats_ws.cell(row=row, column=2)
         cell.value = f"={'+'.join(total_job_count_cells)}"
+        cell.number_format = FORMAT_NUMBER_COMMA_SEPARATED1
         row += 1
         excel_job_stats_ws.cell(row=row, column=1).value = 'Total duration'
         cell = excel_job_stats_ws.cell(row=row, column=2)
@@ -759,6 +755,7 @@ class JobAnalyzer(JobAnalyzerBase):
         excel_job_counts_ws.cell(row=row, column=1).value = 'Total job count'
         cell = excel_job_counts_ws.cell(row=row, column=2)
         cell.value = f"={'+'.join(total_job_count_cells)}"
+        cell.number_format = FORMAT_NUMBER_COMMA_SEPARATED1
         # Add a chart to show the distribution of jobs
         row += 2
         job_count_chart = BarChart3D()
@@ -822,6 +819,7 @@ class JobAnalyzer(JobAnalyzerBase):
         excel_job_durations_ws.cell(row=row, column=1).value = 'Total job duration'
         cell = excel_job_durations_ws.cell(row=row, column=2)
         cell.value = f"={'+'.join(total_duration_cells)}"
+        cell.number_format = FORMAT_NUMBER_COMMA_SEPARATED1
         # Add a chart to show the distribution of job durations
         row += 2
         job_count_chart = BarChart3D()
@@ -885,6 +883,7 @@ class JobAnalyzer(JobAnalyzerBase):
         excel_job_wait_times_ws.cell(row=row, column=1).value = 'Total wait time'
         cell = excel_job_wait_times_ws.cell(row=row, column=2)
         cell.value = f"={'+'.join(total_wait_time_cells)}"
+        cell.number_format = FORMAT_NUMBER_COMMA_SEPARATED1
         # Add a chart to show the distribution of jobs
         row += 2
         job_count_chart = BarChart3D()
@@ -1380,9 +1379,7 @@ def main():
             logger.info(f"Output directory ({output_dir}) doesn't exist, creating")
             makedirs(output_dir)
         log_file_name = path.join(output_dir, f"JobAnalyzer-{timestamp_str}.log")
-        logger_FileHandler = logging.FileHandler(filename=log_file_name)
-        logger_FileHandler.setFormatter(logger_formatter)
-        logger.addHandler(logger_FileHandler)
+        add_file_handler(log_file_name)
 
         if args.debug:
             logger.setLevel(logging.DEBUG)

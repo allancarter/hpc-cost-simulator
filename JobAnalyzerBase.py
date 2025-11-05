@@ -29,16 +29,11 @@ from os.path import dirname, realpath
 import re
 from SchedulerJobInfo import logger as SchedulerJobInfo_logger, SchedulerJobInfo, str_to_datetime, timestamp_to_datetime
 from SchedulerLogParser import SchedulerLogParser
+from shared_logger import get_logger
 from sys import exit
 import yaml
 
-logger = logging.getLogger(__file__)
-logger_formatter = logging.Formatter('%(levelname)s:%(asctime)s: %(message)s')
-logger_streamHandler = logging.StreamHandler()
-logger_streamHandler.setFormatter(logger_formatter)
-logger.addHandler(logger_streamHandler)
-logger.propagate = False
-logger.setLevel(logging.INFO)
+logger = get_logger()
 
 SECONDS_PER_MINUTE = 60
 MINUTES_PER_HOUR = 60
@@ -244,8 +239,10 @@ class JobAnalyzerBase:
             self.get_instance_type_info()
 
         relevant_instances = []
+        # logger.debug(f"required_ram_GiB: {required_ram_GiB} required_cores: {required_cores} required_speed: {required_speed}")
         for instance_type in self.instance_types:
             info = self.instance_type_info[instance_type]
+            # logger.debug(f"instance_type: {instance_type} MemoryInMiB: {info['MemoryInMiB']} MemoryInGB: {info['MemoryInMiB'] / 1024} info: {info}")
             if (info['MemoryInMiB'] / 1024) >= required_ram_GiB:
                 if info['SustainedClockSpeedInGhz'] >= required_speed:
                     if (not self._hyperthreading and info['DefaultCores'] >= required_cores) or (self._hyperthreading and info['DefaultVCpus'] >= required_cores):
