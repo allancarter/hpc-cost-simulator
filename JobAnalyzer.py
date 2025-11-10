@@ -22,11 +22,13 @@ import csv
 from CSVLogParser import CSVLogParser, logger as CSVLogParser_logger
 from datetime import datetime, time, timedelta, timezone
 from EC2InstanceTypeInfoPkg.EC2InstanceTypeInfo import EC2InstanceTypeInfo
+from glob import glob as glob_files
 from JobAnalyzerBase import JobAnalyzerBase, SECONDS_PER_HOUR
 import json
 from LSFLogParser import LSFLogParser, logger as LSFLogParser_logger
 import logging
 from math import ceil
+from multiprocessing import Pool, cpu_count
 from openpyxl import Workbook as XlsWorkbook
 from openpyxl.chart import BarChart3D, LineChart as XlLineChart, Reference as XlReference
 from openpyxl.styles import Alignment as XlsAlignment, Protection as XlsProtection
@@ -239,7 +241,7 @@ class JobAnalyzer(JobAnalyzerBase):
                             logger.debug(f"        Job started in prev hour, ends in this one")
                             runtime_minutes = (end_time - round_hour_seconds)/60
                         else:
-                            logger.error(f"{file}, line {line_number}: Record failed to process correctly: {','.join(job_field_values_array)}")
+                            logger.error(f"{hourly_file}, line {line_number}: Record failed to process correctly: {','.join(job_field_values_array)}")
                         instance_minutes = runtime_minutes * num_hosts
                         core_hours = runtime_minutes * num_hosts * num_cores / 60
                         logger.debug(f"        instance_minutes={instance_minutes} runtime_minutes={runtime_minutes} core_hours={core_hours}")
@@ -1251,6 +1253,218 @@ class JobAnalyzer(JobAnalyzerBase):
         self._process_hourly_jobs()
         self._write_hourly_stats()
 
+    def process_jobs_csv_to_hourly(self, jobs_csv_file: str, output_subdir: str = None) -> None:
+        '''
+        Process a single jobs.csv file and create hourly bucket files
+
+        This method reads a jobs.csv file that was previously created by a scheduler parser,
+        analyzes each job, and writes hourly bucket files. This allows parallel processing
+        of multiple jobs.csv files.
+
+        Args:
+            jobs_csv_file (str): Path to the jobs.csv file to process
+            output_subdir (str): Subdirectory within output_dir for this batch's hourly files.
+                               If None, uses basename of jobs_csv_file
+        '''
+        if not self.instance_type_info:
+            self.get_instance_type_info()
+
+        if output_subdir is None:
+            output_subdir = path.splitext(path.basename(jobs_csv_file))[0]
+        
+        # Create subdirectory for this batch's hourly files
+        batch_hourly_dir = path.join(self._output_dir, 'hourly-files', output_subdir)
+        if not path.exists(batch_hourly_dir):
+            makedirs(batch_hourly_dir)
+        
+        # Temporarily override the hourly files directory
+        original_hourly_dir = self._hourly_files_dir
+        self._hourly_files_dir = batch_hourly_dir
+
+        logger.info(f"Processing {jobs_csv_file} -> {batch_hourly_dir}")
+        
+        # Use CSVLogParser to read the jobs.csv file
+        csv_parser = CSVLogParser(jobs_csv_file, output_csv=None, starttime=self._starttime, endtime=self._endtime)
+        
+        total_jobs = 0
+        total_failed_jobs = 0
+        while True:
+            job = csv_parser.parse_job()
+            if not job:
+                break
+            if not self._filter_job_queue(job):
+                continue
+            if not self._filter_job_project(job):
+                continue
+            total_jobs += 1
+            
+            try:
+                job_cost_data = self.analyze_job(job)
+            except RuntimeError as e:
+                total_failed_jobs += 1
+                logger.error(f"{e}")
+                continue
+            
+            self._add_job_to_hourly_bucket(job_cost_data)
+            
+            if (total_jobs % 10000) == 0:
+                memory = psutil.virtual_memory()
+                logger.info(f"    {jobs_csv_file}: Parsed {total_jobs:,} jobs. mem used: {memory.used:,}/{memory.total:,} = {int(memory.used/memory.total*100)}%")
+        
+        # Write any remaining jobs in buckets
+        self._write_hourly_jobs_buckets_to_file()
+        
+        logger.info(f"Finished processing {jobs_csv_file}: {total_jobs-total_failed_jobs:,}/{total_jobs:,} jobs")
+        
+        # Restore original hourly directory
+        self._hourly_files_dir = original_hourly_dir
+
+    def combine_hourly_files(self, batch_subdirs: list = None) -> None:
+        '''
+        Combine hourly files from multiple batch subdirectories
+
+        This method merges hourly-*.csv files from multiple subdirectories into a single
+        set of hourly files in the main hourly-files directory. This is used after
+        parallel processing of multiple jobs.csv files.
+
+        Args:
+            batch_subdirs (list): List of subdirectory names under hourly-files/ to combine.
+                                If None, auto-discovers all subdirectories.
+        '''
+        hourly_files_base = path.join(self._output_dir, 'hourly-files')
+        
+        if batch_subdirs is None:
+            # Auto-discover subdirectories
+            batch_subdirs = []
+            for item in listdir(hourly_files_base):
+                item_path = path.join(hourly_files_base, item)
+                if path.isdir(item_path):
+                    batch_subdirs.append(item)
+        
+        logger.info(f"Combining hourly files from {len(batch_subdirs)} subdirectories")
+        
+        # Collect all hourly files organized by hour
+        hourly_data_by_hour = {}  # hour -> list of file paths
+        
+        for subdir in batch_subdirs:
+            subdir_path = path.join(hourly_files_base, subdir)
+            if not path.isdir(subdir_path):
+                logger.warning(f"Skipping {subdir_path} - not a directory")
+                continue
+            
+            logger.info(f"  Processing subdirectory: {subdir}")
+            for filename in listdir(subdir_path):
+                if filename.startswith('hourly-') and filename.endswith('.csv'):
+                    # Extract hour from filename: hourly-<HOUR>.csv
+                    hour_str = filename[7:-4]  # Remove 'hourly-' prefix and '.csv' suffix
+                    try:
+                        hour = int(hour_str)
+                    except ValueError:
+                        logger.warning(f"    Skipping invalid filename: {filename}")
+                        continue
+                    
+                    file_path = path.join(subdir_path, filename)
+                    if hour not in hourly_data_by_hour:
+                        hourly_data_by_hour[hour] = []
+                    hourly_data_by_hour[hour].append(file_path)
+        
+        logger.info(f"Found data for {len(hourly_data_by_hour)} unique hours")
+        
+        # Combine files for each hour
+        for hour in sorted(hourly_data_by_hour.keys()):
+            combined_file = path.join(hourly_files_base, f"hourly-{hour}.csv")
+            source_files = hourly_data_by_hour[hour]
+            
+            logger.debug(f"  Combining hour {hour} from {len(source_files)} files")
+            
+            with open(combined_file, 'w') as combined_fh:
+                # Write header
+                combined_fh.write('start_time,Job id,Num Hosts,Runtime (minutes),memory (GB),Wait time (minutes),Instance type,Instance Family,Spot,Hourly Rate,Total Cost\n')
+                
+                # Append data from all source files
+                for source_file in source_files:
+                    with open(source_file, 'r') as source_fh:
+                        lines = source_fh.readlines()
+                        # Skip header if present
+                        if lines and lines[0].startswith('start_time'):
+                            lines = lines[1:]
+                        combined_fh.writelines(lines)
+        
+        logger.info(f"Successfully combined hourly files into {hourly_files_base}")
+
+    @staticmethod
+    def _process_single_csv_worker(args):
+        '''
+        Worker function for parallel processing of jobs.csv files
+        
+        This is a static method that can be called by multiprocessing.Pool
+        
+        Args:
+            args: Tuple of (jobs_csv_file, config_filename, output_dir, starttime, endtime, 
+                           queue_filters, project_filters, output_subdir)
+        
+        Returns:
+            Tuple of (jobs_csv_file, success, message)
+        '''
+        (jobs_csv_file, config_filename, output_dir, starttime, endtime, 
+         queue_filters, project_filters, output_subdir) = args
+        
+        try:
+            # Create a new JobAnalyzer instance for this worker
+            # Note: We use None as scheduler_parser since we're reading from CSV
+            job_analyzer = JobAnalyzer(None, config_filename, output_dir, starttime, 
+                                      endtime, queue_filters, project_filters)
+            
+            job_analyzer.process_jobs_csv_to_hourly(jobs_csv_file, output_subdir)
+            
+            return (jobs_csv_file, True, "Success")
+        except Exception as e:
+            logger.exception(f"Error processing {jobs_csv_file}")
+            return (jobs_csv_file, False, str(e))
+
+    def process_jobs_csv_parallel(self, jobs_csv_files: list, num_processes: int = None) -> None:
+        '''
+        Process multiple jobs.csv files in parallel
+
+        Args:
+            jobs_csv_files (list): List of paths to jobs.csv files to process
+            num_processes (int): Number of parallel processes. If None, uses cpu_count()
+        '''
+        if num_processes is None:
+            num_processes = cpu_count()
+        
+        logger.info(f"Processing {len(jobs_csv_files)} jobs.csv files using {num_processes} processes")
+        
+        # Prepare arguments for each worker
+        worker_args = []
+        for idx, jobs_csv_file in enumerate(jobs_csv_files):
+            output_subdir = f"batch_{idx:04d}_{path.splitext(path.basename(jobs_csv_file))[0]}"
+            args = (jobs_csv_file, self._config_filename, self._output_dir, 
+                   self._starttime, self._endtime, self._queue_filters, 
+                   self._project_filters, output_subdir)
+            worker_args.append(args)
+        
+        # Process in parallel
+        with Pool(processes=num_processes) as pool:
+            results = pool.map(JobAnalyzer._process_single_csv_worker, worker_args)
+        
+        # Report results
+        successes = sum(1 for _, success, _ in results if success)
+        failures = len(results) - successes
+        
+        logger.info(f"Parallel processing complete: {successes} succeeded, {failures} failed")
+        
+        if failures > 0:
+            logger.warning("Failed files:")
+            for csv_file, success, message in results:
+                if not success:
+                    logger.warning(f"  {csv_file}: {message}")
+        
+        # Now combine all the hourly files
+        batch_subdirs = [f"batch_{idx:04d}_{path.splitext(path.basename(f))[0]}" 
+                        for idx, f in enumerate(jobs_csv_files)]
+        self.combine_hourly_files(batch_subdirs)
+
     def _filter_job_queue(self, job: SchedulerJobInfo) -> bool:
         '''
         Filter the job queue
@@ -1363,6 +1577,18 @@ def main():
         hourly_stats_csv_parser = subparsers.add_parser('hourly_stats_csv', help='Parse hourly_stats.csv file so can create Excel workbook (xlsx).', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
         hourly_stats_csv_parser.add_argument("--input-hourly-stats-csv", required=True, help="Existing hourly_stats.csv file to use as input.")
 
+        process_jobs_csv_parser = subparsers.add_parser('process_jobs_csv', help='Process a single jobs.csv file to create hourly bucket files.', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+        process_jobs_csv_parser.add_argument("--input-jobs-csv", required=True, help="Path to the jobs.csv file to process.")
+        process_jobs_csv_parser.add_argument("--output-subdir", required=False, help="Subdirectory name for hourly files. If not specified, uses the basename of the input file.")
+
+        parallel_jobs_csv_parser = subparsers.add_parser('parallel_jobs_csv', help='Process multiple jobs.csv files in parallel.', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+        parallel_jobs_csv_parser.add_argument("--jobs-csv-dir", required=True, help="Directory containing jobs.csv files to process in parallel.")
+        parallel_jobs_csv_parser.add_argument("--jobs-csv-pattern", default="*.csv", help="Glob pattern for jobs.csv files (e.g., 'jobs_*.csv').")
+        parallel_jobs_csv_parser.add_argument("--num-processes", type=int, default=None, help="Number of parallel processes. Defaults to number of CPUs.")
+
+        combine_hourly_parser = subparsers.add_parser('combine_hourly', help='Combine hourly files from multiple batch subdirectories.', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+        combine_hourly_parser.add_argument("--batch-subdirs", nargs='+', default=None, help="List of subdirectory names to combine. If not specified, auto-discovers all subdirectories.")
+
         parser.add_argument("--queues", default=None, help="Comma separated list of regular expressions of queues to include/exclude. Prefix the queue with '-' to exclude. The regular expressions are evaluated in the order given and the first match has precedence and stops further evaluations. Regular expressions have an implicit ^ at the beginning.")
 
         parser.add_argument("--projects", default=None, help="Comma separated list of regular expressions of projects to include/exclude. Prefix the project with '-' to exclude. The regular expressions are evaluated in the order given and the first match has precedence and stops further evaluations. Regular expressions have an implicit ^ at the beginning.")
@@ -1434,6 +1660,34 @@ def main():
             jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects)
             jobAnalyzer.parse_hourly_stats_csv(args.input_hourly_stats_csv)
             jobAnalyzer._write_hourly_stats()
+        elif args.parser == 'process_jobs_csv':
+            logger.info(f"Processing single jobs.csv file: {args.input_jobs_csv}")
+            scheduler_parser = None
+            jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects)
+            jobAnalyzer.process_jobs_csv_to_hourly(args.input_jobs_csv, args.output_subdir)
+        elif args.parser == 'parallel_jobs_csv':
+            logger.info(f"Processing multiple jobs.csv files in parallel from {args.jobs_csv_dir}")
+            scheduler_parser = None
+            jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects)
+            
+            # Find all matching CSV files
+            csv_files = glob_files(path.join(args.jobs_csv_dir, args.jobs_csv_pattern))
+            if not csv_files:
+                logger.error(f"No CSV files found matching pattern {args.jobs_csv_pattern} in {args.jobs_csv_dir}")
+                exit(1)
+            
+            logger.info(f"Found {len(csv_files)} CSV files to process")
+            jobAnalyzer.process_jobs_csv_parallel(csv_files, args.num_processes)
+            
+            # After combining, process the hourly files and generate statistics
+            logger.info("Processing combined hourly files to generate statistics")
+            jobAnalyzer._process_hourly_jobs()
+            jobAnalyzer._write_hourly_stats()
+        elif args.parser == 'combine_hourly':
+            logger.info(f"Combining hourly files from subdirectories")
+            scheduler_parser = None
+            jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects)
+            jobAnalyzer.combine_hourly_files(args.batch_subdirs)
 
         if scheduler_parser:
             if args.output_csv:
