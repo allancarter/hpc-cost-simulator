@@ -5,6 +5,7 @@ botocore
 colored
 GitPython
 ijson
+lzip
 mkdocs
 mypy
 openpyxl

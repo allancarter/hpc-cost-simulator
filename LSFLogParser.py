@@ -12,10 +12,12 @@ SPDX-License-Identifier: MIT-0
 '''
 
 import argparse
+import bz2
 from copy import deepcopy
 import csv
 import json
 import logging
+import lzip
 from LSB_ACCT_FIELDS import LSB_ACCT_RECORD_FORMATS, MINIMAL_LSB_ACCT_FIELDS
 from MemoryUtils import MEM_GB, MEM_KB, MEM_MB, MEM_TB, MEM_PB, MEM_EB
 from os import listdir, path
@@ -35,28 +37,118 @@ logger.addHandler(logger_streamHandler)
 logger.propagate = False
 logger.setLevel(logging.INFO)
 
+class LzipTextWrapper:
+    '''
+    A streaming wrapper to provide a text file-like interface for lzip decompression.
+    Uses lzip.decompress_file_iter to process the file in chunks without loading
+    the entire file into memory.
+    '''
+    def __init__(self, filepath, errors='replace'):
+        self.filepath = filepath
+        self.errors = errors
+        # Use streaming decompression iterator (pass filepath directly)
+        self._chunk_iter = lzip.decompress_file_iter(filepath)
+        self._buffer = ''  # Text buffer for incomplete lines
+        self._finished = False
+    
+    def __iter__(self):
+        return self
+    
+    def __next__(self):
+        line = self.readline()
+        if not line:
+            raise StopIteration
+        return line
+    
+    def readline(self):
+        '''Read and return one line from the stream.'''
+        while '\n' not in self._buffer and not self._finished:
+            try:
+                # Get next chunk of decompressed bytes
+                chunk_bytes = next(self._chunk_iter)
+                # Decode bytes to text
+                chunk_text = chunk_bytes.decode('utf-8', errors=self.errors)
+                self._buffer += chunk_text
+            except StopIteration:
+                self._finished = True
+                break
+        
+        # Extract one line from buffer
+        if '\n' in self._buffer:
+            line, self._buffer = self._buffer.split('\n', 1)
+            return line + '\n'
+        elif self._buffer:
+            # Return remaining text as final line
+            line = self._buffer
+            self._buffer = ''
+            return line
+        else:
+            return ''
+    
+    def read(self, size=-1):
+        '''Read and return up to size characters.'''
+        if size == -1:
+            # Read all remaining data
+            result = self._buffer
+            while not self._finished:
+                try:
+                    chunk_bytes = next(self._chunk_iter)
+                    result += chunk_bytes.decode('utf-8', errors=self.errors)
+                except StopIteration:
+                    self._finished = True
+            self._buffer = ''
+            return result
+        else:
+            # Read up to size characters
+            while len(self._buffer) < size and not self._finished:
+                try:
+                    chunk_bytes = next(self._chunk_iter)
+                    self._buffer += chunk_bytes.decode('utf-8', errors=self.errors)
+                except StopIteration:
+                    self._finished = True
+            
+            result = self._buffer[:size]
+            self._buffer = self._buffer[size:]
+            return result
+    
+    def close(self):
+        # lzip.decompress_file_iter manages the file handle internally
+        # Just mark as finished
+        self._finished = True
+        self._buffer = ''
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
 class LSFLogParser(SchedulerLogParser):
     '''
     Parse LSF bacct.lsb* files to get job completion information.
     '''
 
-    def __init__(self, logfile_dir: str, output_csv: str, default_max_mem_gb: float, unit_for_limits: str='MB', starttime: str=None, endtime: str=None):
+    def __init__(self, output_csv: str, default_max_mem_gb: float, logfile_path: str=None, logfile_dir: str=None, unit_for_limits: str='MB', starttime: str=None, endtime: str=None):
         '''
         Constructor
 
         Args:
-            logfile_dir (str): Directory where LSF log files are located.
-            output_dir (str):
-                Directory where output will be written.
-                Will be created if it doesn't already exist.
             output_csv (str): CSV file where parsed jobs will be written.
             default_max_mem_gb (float): Default maximum memory for a job in GB.
+            logfile_path (str): Path to a single LSF log file (lsb.acct file). Supports .bz2 and .lz compressed files.
+            logfile_dir (str): Directory containing LSF log files (for backwards compatibility).
             unit_for_limits (str): Unit for job memory limits (KB, MB, GB, TB, PB, EB)
             starttime (str): Select jobs after the specified time
             endtime (str): Select jobs after the specified time
         '''
         super().__init__(None, output_csv, starttime, endtime)
-        self._logfile_dir = logfile_dir
+        
+        # Ensure exactly one of logfile_path or logfile_dir is provided
+        if logfile_path and logfile_dir:
+            raise ValueError("Cannot specify both logfile_path and logfile_dir. Please provide only one.")
+        if not logfile_path and not logfile_dir:
+            raise ValueError("Must specify either logfile_path or logfile_dir.")
+        
         self._default_max_mem_gb = default_max_mem_gb
 
         # Create mapping from unit string to memory constant
@@ -71,7 +163,12 @@ class LSFLogParser(SchedulerLogParser):
         self._unit_for_limits = unit_for_limits
         self._mem_unit_multiplier = self._unit_to_bytes[unit_for_limits]
 
-        self._lsb_acct_files = self._get_lsb_acct_files(logfile_dir)
+        # Handle both single file and directory modes
+        if logfile_path:
+            self._lsb_acct_files = [logfile_path]
+        else:
+            self._lsb_acct_files = self._get_lsb_acct_files(logfile_dir)
+        
         self._lsb_acct_filename = None
         self._lsb_acct_fh = None
         self._lsb_acct_csv_reader = None
@@ -118,7 +215,7 @@ class LSFLogParser(SchedulerLogParser):
                 self._lsb_acct_filename = self._lsb_acct_files.pop(0)
                 logger.info(f"Parsing lsb.acct file: {self._lsb_acct_filename}")
                 self._lsb_acct_line_number = 0
-                self._lsb_acct_fh = open(self._lsb_acct_filename, 'r', errors='replace')
+                self._lsb_acct_fh = self._open_log_file(self._lsb_acct_filename)
                 csv.field_size_limit(200000)
                 self._lsb_acct_csv_reader = csv.reader(self._lsb_acct_fh, delimiter=' ')
             try:
@@ -131,7 +228,7 @@ class LSFLogParser(SchedulerLogParser):
             except StopIteration:
                 logger.debug(f"Reached EOF of {self._lsb_acct_filename}")
                 self._lsb_acct_csv_reader = None
-                self._lsb_acct_fh.close()
+                self._close_log_file()
                 continue
             self._lsb_acct_line_number += 1
             logger.debug(f"line {self._lsb_acct_line_number}: {record_fields}")
@@ -235,20 +332,53 @@ class LSFLogParser(SchedulerLogParser):
             else:
                 self.total_jobs_outside_time_window += 1
 
+    def _open_log_file(self, logfile_path: str):
+        '''
+        Open a log file, with support for decompressing .bz2 and .lz files on the fly.
+
+        Args:
+            logfile_path (str): Path to the log file.
+        Returns:
+            file object: File handle for reading
+        '''
+        if not path.exists(logfile_path):
+            logger.error(f"Input file doesn't exist: {logfile_path}")
+            exit(1)
+        
+        if logfile_path.endswith('.bz2'):
+            logger.info(f"Decompressing .bz2 file using bz2 module")
+            # Use Python's built-in bz2 module to decompress on the fly
+            return bz2.open(logfile_path, 'rt', errors='replace')
+        elif logfile_path.endswith('.lz'):
+            logger.info(f"Decompressing .lz file using lzip module")
+            # Use lzip module wrapper to decompress
+            return LzipTextWrapper(logfile_path, errors='replace')
+        else:
+            # Regular uncompressed file
+            return open(logfile_path, 'r', errors='replace')
+
+    def _close_log_file(self):
+        '''
+        Close the log file.
+        '''
+        if self._lsb_acct_fh:
+            self._lsb_acct_fh.close()
+            self._lsb_acct_fh = None
+
     def _get_lsb_acct_files(self, logfile_dir):
         '''
         Get the list of lsb.acct* files that will be parsed
 
         Args:
-            logfile_dir (str): Directory containining LSF log files.
+            logfile_dir (str): Directory containing LSF log files.
         Returns:
-            (str): List of filenames
+            (list): List of filenames
         '''
         lsb_acct_files = []
         try:
-            all_files = sorted(listdir(self._logfile_dir))
+            all_files = sorted(listdir(logfile_dir))
         except FileNotFoundError as e:
-            logger.error(f"Input directory doesn't exist: {self._logfile_dir}: {e}")
+            logger.error(f"Input directory doesn't exist: {logfile_dir}: {e}")
             exit(1)
         for file in all_files:
             filename = path.join(logfile_dir, file)
@@ -528,7 +658,8 @@ def main() -> None:
     Uses argparse to get command line arguments.
     '''
     parser = argparse.ArgumentParser(description="Parse LSF logs.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--logfile-dir", required=True, help="LSF logfile directory")
+    parser.add_argument("--logfile", help="LSF logfile path (lsb.acct file). Supports .bz2 and .lz compressed files.")
+    parser.add_argument("--logfile-dir", help="LSF logfile directory to support multiple files. Supports .bz2 and .lz compressed files. Typically used for smaller files.)")
     parser.add_argument("--output-csv", required=True, help="CSV file with parsed job completion records")
     parser.add_argument("--unit-for-limits", type=str, default='MB', required=False, choices=['KB', 'MB', 'GB', 'TB', 'PB', 'EB'], help="Unit for job memory limits.  Default is MB. Options: KB, MB, GB, TB, PB, EB")
     parser.add_argument("--default-max-mem-gb", type=float, default=0.0, required=False, help="Default maximum memory for a job in GB.")
@@ -537,6 +668,12 @@ def main() -> None:
     parser.add_argument("--disable-version-check", action='store_const', const=True, default=False, help="Disable git version check")
     parser.add_argument("--debug", '-d', action='store_const', const=True, default=False, help="Enable debug mode")
     args = parser.parse_args()
+
+    # Validate that exactly one of --logfile or --logfile-dir is provided
+    if args.logfile and args.logfile_dir:
+        parser.error("Cannot specify both --logfile and --logfile-dir. Please provide only one.")
+    if not args.logfile and not args.logfile_dir:
+        parser.error("Must specify either --logfile or --logfile-dir.")
 
     if args.debug:
         logger.setLevel(logging.DEBUG)
@@ -548,9 +685,12 @@ def main() -> None:
         exit(1)
 
     logger.info('Started LSF log parser')
-    logger.info(f"LSF logfile directory: {args.logfile_dir}")
+    if args.logfile:
+        logger.info(f"LSF logfile: {args.logfile}")
+    else:
+        logger.info(f"LSF logfile directory: {args.logfile_dir}")
 
-    lsfLogParser = LSFLogParser(args.logfile_dir, args.output_csv, args.default_max_mem_gb, unit_for_limits=args.unit_for_limits, starttime=args.starttime, endtime=args.endtime)
+    lsfLogParser = LSFLogParser(args.output_csv, args.default_max_mem_gb, logfile_path=args.logfile, logfile_dir=args.logfile_dir, unit_for_limits=args.unit_for_limits, starttime=args.starttime, endtime=args.endtime)
     try:
         lsfLogParser.parse_jobs()
     except Exception as e:
@@ -561,7 +701,7 @@ def main() -> None:
         logger.error(f"Failed")
         exit(1)
 
-    logger.info(f"{lsfLogParser._num_input_jobs:} jobs parsed")
+    logger.info(f"{lsfLogParser._num_input_jobs:,} jobs parsed")
     if args.output_csv:
         logger.info(f"{lsfLogParser._num_output_jobs:,} jobs written to {args.output_csv}")
     if lsfLogParser._invalid_record_dict:
