@@ -50,16 +50,16 @@ class LzipTextWrapper:
         self._chunk_iter = lzip.decompress_file_iter(filepath)
         self._buffer = ''  # Text buffer for incomplete lines
         self._finished = False
-    
+
     def __iter__(self):
         return self
-    
+
     def __next__(self):
         line = self.readline()
         if not line:
             raise StopIteration
         return line
-    
+
     def readline(self):
         '''Read and return one line from the stream.'''
         while '\n' not in self._buffer and not self._finished:
@@ -72,7 +72,7 @@ class LzipTextWrapper:
             except StopIteration:
                 self._finished = True
                 break
-        
+
         # Extract one line from buffer
         if '\n' in self._buffer:
             line, self._buffer = self._buffer.split('\n', 1)
@@ -84,7 +84,7 @@ class LzipTextWrapper:
             return line
         else:
             return ''
-    
+
     def read(self, size=-1):
         '''Read and return up to size characters.'''
         if size == -1:
@@ -106,20 +106,114 @@ class LzipTextWrapper:
                     self._buffer += chunk_bytes.decode('utf-8', errors=self.errors)
                 except StopIteration:
                     self._finished = True
-            
+
             result = self._buffer[:size]
             self._buffer = self._buffer[size:]
             return result
-    
+
     def close(self):
         # lzip.decompress_file_iter manages the file handle internally
         # Just mark as finished
         self._finished = True
         self._buffer = ''
-    
+
     def __enter__(self):
         return self
-    
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+class LzBz2TextWrapper:
+    '''
+    A streaming wrapper to provide a text file-like interface for double-compressed .lz.bz2 files.
+    Streams bz2 decompression into lzip decompression without loading entire file into memory.
+    '''
+    def __init__(self, filepath, errors='replace'):
+        self.filepath = filepath
+        self.errors = errors
+
+        # Open bz2 file for streaming decompression
+        # This gives us a file-like object that streams bz2-decompressed (but still lz-compressed) data
+        logger.info(f"Setting up streaming bz2 decompression")
+        self._bz2_fh = bz2.open(filepath, 'rb')
+
+        # Now use lzip.decompress_file_like_iter to decompress the lz layer
+        # This reads from the bz2 file handle incrementally as needed
+        logger.info(f"Setting up streaming lz decompression from bz2 stream")
+        self._chunk_iter = lzip.decompress_file_like_iter(self._bz2_fh)
+        self._buffer = ''  # Text buffer for incomplete lines
+        self._finished = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if not line:
+            raise StopIteration
+        return line
+
+    def readline(self):
+        '''Read and return one line from the stream.'''
+        while '\n' not in self._buffer and not self._finished:
+            try:
+                # Get next chunk of decompressed bytes
+                chunk_bytes = next(self._chunk_iter)
+                # Decode bytes to text
+                chunk_text = chunk_bytes.decode('utf-8', errors=self.errors)
+                self._buffer += chunk_text
+            except StopIteration:
+                self._finished = True
+                break
+
+        # Extract one line from buffer
+        if '\n' in self._buffer:
+            line, self._buffer = self._buffer.split('\n', 1)
+            return line + '\n'
+        elif self._buffer:
+            # Return remaining text as final line
+            line = self._buffer
+            self._buffer = ''
+            return line
+        else:
+            return ''
+
+    def read(self, size=-1):
+        '''Read and return up to size characters.'''
+        if size == -1:
+            # Read all remaining data
+            result = self._buffer
+            while not self._finished:
+                try:
+                    chunk_bytes = next(self._chunk_iter)
+                    result += chunk_bytes.decode('utf-8', errors=self.errors)
+                except StopIteration:
+                    self._finished = True
+            self._buffer = ''
+            return result
+        else:
+            # Read up to size characters
+            while len(self._buffer) < size and not self._finished:
+                try:
+                    chunk_bytes = next(self._chunk_iter)
+                    self._buffer += chunk_bytes.decode('utf-8', errors=self.errors)
+                except StopIteration:
+                    self._finished = True
+
+            result = self._buffer[:size]
+            self._buffer = self._buffer[size:]
+            return result
+
+    def close(self):
+        '''Close the wrapper and underlying file handles.'''
+        self._finished = True
+        self._buffer = ''
+        if hasattr(self, '_bz2_fh') and self._bz2_fh:
+            self._bz2_fh.close()
+
+    def __enter__(self):
+        return self
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
@@ -135,20 +229,20 @@ class LSFLogParser(SchedulerLogParser):
         Args:
             output_csv (str): CSV file where parsed jobs will be written.
             default_max_mem_gb (float): Default maximum memory for a job in GB.
-            logfile_path (str): Path to a single LSF log file (lsb.acct file). Supports .bz2 and .lz compressed files.
+            logfile_path (str): Path to a single LSF log file (lsb.acct file). Supports .bz2, .lz, and .lz.bz2 compressed files.
             logfile_dir (str): Directory containing LSF log files (for backwards compatibility).
             unit_for_limits (str): Unit for job memory limits (KB, MB, GB, TB, PB, EB)
             starttime (str): Select jobs after the specified time
             endtime (str): Select jobs after the specified time
         '''
         super().__init__(None, output_csv, starttime, endtime)
-        
+
         # Ensure exactly one of logfile_path or logfile_dir is provided
         if logfile_path and logfile_dir:
             raise ValueError("Cannot specify both logfile_path and logfile_dir. Please provide only one.")
         if not logfile_path and not logfile_dir:
             raise ValueError("Must specify either logfile_path or logfile_dir.")
-        
+
         self._default_max_mem_gb = default_max_mem_gb
 
         # Create mapping from unit string to memory constant
@@ -168,7 +262,7 @@ class LSFLogParser(SchedulerLogParser):
             self._lsb_acct_files = [logfile_path]
         else:
             self._lsb_acct_files = self._get_lsb_acct_files(logfile_dir)
-        
+
         self._lsb_acct_filename = None
         self._lsb_acct_fh = None
         self._lsb_acct_csv_reader = None
@@ -334,7 +428,7 @@ class LSFLogParser(SchedulerLogParser):
 
     def _open_log_file(self, logfile_path: str):
         '''
-        Open a log file, with support for decompressing .bz2 and .lz files on the fly.
+        Open a log file, with support for decompressing .bz2, .lz, and .lz.bz2 files on the fly.
 
         Args:
             logfile_path (str): Path to the log file.
@@ -344,8 +438,13 @@ class LSFLogParser(SchedulerLogParser):
         if not path.exists(logfile_path):
             logger.error(f"Input file doesn't exist: {logfile_path}")
             exit(1)
-        
-        if logfile_path.endswith('.bz2'):
+
+        # Check for double compression first (.lz.bz2)
+        if logfile_path.endswith('.lz.bz2'):
+            logger.info(f"Decompressing .lz.bz2 file (double compressed)")
+            # Use a custom wrapper to handle double decompression
+            return LzBz2TextWrapper(logfile_path, errors='replace')
+        elif logfile_path.endswith('.bz2'):
             logger.info(f"Decompressing .bz2 file using bz2 module")
             # Use Python's built-in bz2 module to decompress on the fly
             return bz2.open(logfile_path, 'rt', errors='replace')
@@ -658,8 +757,8 @@ def main() -> None:
     Uses argparse to get command line arguments.
     '''
     parser = argparse.ArgumentParser(description="Parse LSF logs.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--logfile", help="LSF logfile path (lsb.acct file). Supports .bz2 and .lz compressed files.")
-    parser.add_argument("--logfile-dir", help="LSF logfile directory to support multiple files. Supports .bz2 and .lz compressed files. Typically used for smaller files.)")
+    parser.add_argument("--logfile", help="LSF logfile path (lsb.acct file). Supports .bz2, .lz, and .lz.bz2 compressed files.")
+    parser.add_argument("--logfile-dir", help="LSF logfile directory to support multiple files. Supports .bz2, .lz, and .lz.bz2 compressed files. Typically used for smaller files.)")
     parser.add_argument("--output-csv", required=True, help="CSV file with parsed job completion records")
     parser.add_argument("--unit-for-limits", type=str, default='MB', required=False, choices=['KB', 'MB', 'GB', 'TB', 'PB', 'EB'], help="Unit for job memory limits.  Default is MB. Options: KB, MB, GB, TB, PB, EB")
     parser.add_argument("--default-max-mem-gb", type=float, default=0.0, required=False, help="Default maximum memory for a job in GB.")
