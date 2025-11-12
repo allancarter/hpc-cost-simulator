@@ -151,6 +151,37 @@ class JobAnalyzer(JobAnalyzerBase):
         self.total_stats['instance_hours'] += instance_minutes_within_hour / 60
         logger.debug(f"        self.total_stats['instance_hours']={self.total_stats['instance_hours']}")
 
+    def _load_existing_job_collector(self) -> bool:
+        '''
+        Load existing job collector data if it exists
+        
+        This is used when running hourly_stats mode after combine_hourly
+        to preserve the job statistics that were already combined.
+        
+        Returns:
+            bool: True if data was loaded, False if file doesn't exist
+        '''
+        collector_file = path.join(self._output_dir, 'job_collector.json')
+        
+        if not path.exists(collector_file):
+            logger.debug(f"No existing job collector file found at {collector_file}")
+            return False
+        
+        logger.info(f"Loading existing job collector data from {collector_file}")
+        
+        try:
+            with open(collector_file, 'r') as f:
+                loaded_collector = json.load(f)
+            
+            # Replace the current job collector with the loaded data
+            self.job_data_collector = loaded_collector
+            logger.info(f"Successfully loaded job collector data")
+            return True
+        
+        except Exception as e:
+            logger.error(f"Failed to load job collector from {collector_file}: {e}")
+            return False
+
     def _process_hourly_jobs(self) -> None:
         '''
         Process hourly job CSV files
@@ -282,7 +313,7 @@ class JobAnalyzer(JobAnalyzerBase):
         This is done in batches to reduce the number of file opens and closes.
         '''
         for round_hour, jobs in self.jobs_by_hours.items():
-            hourly_file_name = path.join(self._output_dir, 'hourly-files', f"hourly-{round_hour}.csv")
+            hourly_file_name = path.join(self._hourly_files_dir, f"hourly-{round_hour}.csv")
             with open(hourly_file_name, 'a+') as job_file:
                 if job_file.tell() == 0:    # Empty file - add headers
                     job_file.write('start_time,Job id,Num Hosts,Runtime (minutes),memory (GB),Wait time (minutes),Instance type,Instance Family,Spot,Hourly Rate,Total Cost\n')
@@ -300,6 +331,12 @@ class JobAnalyzer(JobAnalyzerBase):
         '''
         Write hourly stats to CSV and Excel files
         '''
+        # Load existing job collector data if it exists (from combine_hourly step)
+        self._load_existing_job_collector()
+        
+        # Write job collector data to summary.csv
+        self._dump_job_collector_to_csv()
+        
         self._write_hourly_stats_csv()
 
         self._write_hourly_stats_xlsx()
@@ -1305,6 +1342,8 @@ class JobAnalyzer(JobAnalyzerBase):
                 logger.error(f"{e}")
                 continue
             
+            # Add job to collector for job statistics (counts, durations, wait times)
+            self._add_job_to_collector(job)
             self._add_job_to_hourly_bucket(job_cost_data)
             
             if (total_jobs % 10000) == 0:
@@ -1314,10 +1353,69 @@ class JobAnalyzer(JobAnalyzerBase):
         # Write any remaining jobs in buckets
         self._write_hourly_jobs_buckets_to_file()
         
+        # Save job collector data for this batch as JSON
+        self._save_batch_job_collector(batch_hourly_dir)
+        
         logger.info(f"Finished processing {jobs_csv_file}: {total_jobs-total_failed_jobs:,}/{total_jobs:,} jobs")
         
         # Restore original hourly directory
         self._hourly_files_dir = original_hourly_dir
+
+    def _save_batch_job_collector(self, batch_dir: str) -> None:
+        '''
+        Save the job_data_collector for this batch as a JSON file
+
+        Args:
+            batch_dir (str): Directory where to save the job collector data
+        '''
+        collector_file = path.join(batch_dir, 'job_collector.json')
+        logger.info(f"Saving job collector data to {collector_file}")
+        
+        with open(collector_file, 'w') as f:
+            json.dump(self.job_data_collector, f, indent=2)
+    
+    def _combine_job_collectors(self, batch_subdirs: list) -> None:
+        '''
+        Combine job_data_collector data from multiple batch subdirectories
+
+        This merges the job statistics (counts, durations, wait times) from all batches
+        into the main job_data_collector.
+
+        Args:
+            batch_subdirs (list): List of subdirectory names containing job_collector.json files
+        '''
+        logger.info(f"Combining job collector data from {len(batch_subdirs)} batches")
+        
+        # Clear the current job collector
+        self._clear_job_stats()
+        
+        hourly_files_base = path.join(self._output_dir, 'hourly-files')
+        
+        for subdir in batch_subdirs:
+            collector_file = path.join(hourly_files_base, subdir, 'job_collector.json')
+            
+            if not path.exists(collector_file):
+                logger.warning(f"Job collector file not found: {collector_file}, skipping")
+                continue
+            
+            logger.debug(f"Loading job collector from {collector_file}")
+            
+            try:
+                with open(collector_file, 'r') as f:
+                    batch_collector = json.load(f)
+                
+                # Merge the batch collector into the main collector
+                for ram_range, runtime_dict in batch_collector.items():
+                    for runtime_range, stats in runtime_dict.items():
+                        self.job_data_collector[ram_range][runtime_range]['number_of_jobs'] += stats['number_of_jobs']
+                        self.job_data_collector[ram_range][runtime_range]['total_duration_minutes'] += stats['total_duration_minutes']
+                        self.job_data_collector[ram_range][runtime_range]['total_wait_minutes'] += stats['total_wait_minutes']
+            
+            except Exception as e:
+                logger.error(f"Failed to load/merge job collector from {collector_file}: {e}")
+                continue
+        
+        logger.info(f"Successfully combined job collector data from {len(batch_subdirs)} batches")
 
     def combine_hourly_files(self, batch_subdirs: list = None) -> None:
         '''
@@ -1391,6 +1489,19 @@ class JobAnalyzer(JobAnalyzerBase):
                         combined_fh.writelines(lines)
         
         logger.info(f"Successfully combined hourly files into {hourly_files_base}")
+        
+        # Combine job collector data from all batches
+        self._combine_job_collectors(batch_subdirs)
+        
+        # Save the combined job collector as JSON in the main output directory
+        combined_collector_file = path.join(self._output_dir, 'job_collector.json')
+        logger.info(f"Saving combined job collector to {combined_collector_file}")
+        with open(combined_collector_file, 'w') as f:
+            json.dump(self.job_data_collector, f, indent=2)
+        
+        # Write combined job collector to CSV
+        self._dump_job_collector_to_csv()
+        logger.info(f"Successfully combined and saved job statistics")
 
     @staticmethod
     def _process_single_csv_worker(args):
