@@ -73,7 +73,11 @@ class JobAnalyzerBase:
 
         if not path.exists(self._hourly_files_dir):
             logger.info(f"Hourly files directory ({self._hourly_files_dir}) doesn't exist, creating")
-            makedirs(self._hourly_files_dir)
+            try:
+                makedirs(self._hourly_files_dir)
+            except FileExistsError:
+                # Directory was created between the check and this call by another process.
+                logger.info(f"Hourly files directory ({self._hourly_files_dir}) already exists, continuing.")
 
         logger.info(f"Loading configuration from {config_filename}.")
         self.config = JobAnalyzerBase.read_configuration(config_filename)

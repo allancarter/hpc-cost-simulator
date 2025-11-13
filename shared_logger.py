@@ -63,13 +63,3 @@ def get_logger():
         logging.Logger: The shared logger
     """
     return logger
-
-
-
-
-
-
-
-
-
-
