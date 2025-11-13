@@ -15,6 +15,7 @@ import argparse
 import bz2
 from copy import deepcopy
 import csv
+from datetime import timezone
 import json
 import logging
 import lzip
@@ -28,6 +29,15 @@ from SchedulerJobInfo import SchedulerJobInfo, logger as SchedulerJobInfo_logger
 from SchedulerLogParser import SchedulerLogParser, logger as SchedulerLogParser_logger
 from sys import exit
 from VersionCheck import logger as VersionCheck_logger, VersionCheck
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    # Python < 3.9 compatibility: use pytz
+    import pytz
+    class ZoneInfo:
+        """Compatibility wrapper for pytz to match zoneinfo interface."""
+        def __new__(cls, key):
+            return pytz.timezone(key)
 
 logger = logging.getLogger(__file__)
 logger_formatter = logging.Formatter('%(levelname)s:%(asctime)s: %(message)s')
@@ -222,7 +232,7 @@ class LSFLogParser(SchedulerLogParser):
     Parse LSF bacct.lsb* files to get job completion information.
     '''
 
-    def __init__(self, output_csv: str, default_max_mem_gb: float, logfile_path: str=None, logfile_dir: str=None, unit_for_limits: str='MB', starttime: str=None, endtime: str=None):
+    def __init__(self, output_csv: str, default_max_mem_gb: float, logfile_path: str=None, logfile_dir: str=None, unit_for_limits: str='MB', starttime: str=None, endtime: str=None, source_timezone: str=None):
         '''
         Constructor
 
@@ -234,6 +244,8 @@ class LSFLogParser(SchedulerLogParser):
             unit_for_limits (str): Unit for job memory limits (KB, MB, GB, TB, PB, EB)
             starttime (str): Select jobs after the specified time
             endtime (str): Select jobs after the specified time
+            source_timezone (str): REQUIRED. Timezone of the LSF cluster (e.g., 'America/Los_Angeles', 'Asia/Kolkata', 'UTC'). 
+                                   LSF timestamps are in local time and will be converted to UTC.
         '''
         super().__init__(None, output_csv, starttime, endtime)
 
@@ -242,6 +254,21 @@ class LSFLogParser(SchedulerLogParser):
             raise ValueError("Cannot specify both logfile_path and logfile_dir. Please provide only one.")
         if not logfile_path and not logfile_dir:
             raise ValueError("Must specify either logfile_path or logfile_dir.")
+
+        # Validate and parse the source timezone (required)
+        if not source_timezone:
+            raise ValueError("--timezone is required. LSF timestamps are in local time and must be converted to UTC. "
+                           "Specify the timezone of your LSF cluster (e.g., 'America/Los_Angeles', 'Asia/Kolkata', 'UTC')")
+        
+        # Parse and store the source timezone
+        try:
+            if source_timezone.upper() == 'UTC':
+                self._source_tz = timezone.utc
+            else:
+                self._source_tz = ZoneInfo(source_timezone)
+            logger.info(f"Using source timezone: {source_timezone} - all output timestamps will be in UTC")
+        except Exception as e:
+            raise ValueError(f"Invalid timezone '{source_timezone}': {e}. Use IANA timezone names like 'America/Los_Angeles', 'Asia/Kolkata', or 'UTC'")
 
         self._default_max_mem_gb = default_max_mem_gb
 
@@ -762,8 +789,9 @@ def main() -> None:
     parser.add_argument("--output-csv", required=True, help="CSV file with parsed job completion records")
     parser.add_argument("--unit-for-limits", type=str, default='MB', required=False, choices=['KB', 'MB', 'GB', 'TB', 'PB', 'EB'], help="Unit for job memory limits.  Default is MB. Options: KB, MB, GB, TB, PB, EB")
     parser.add_argument("--default-max-mem-gb", type=float, default=0.0, required=False, help="Default maximum memory for a job in GB.")
-    parser.add_argument("--starttime", help="Select jobs after the specified time. Format YYYY-MM-DDTHH:MM:SS")
-    parser.add_argument("--endtime", help="Select jobs before the specified time. Format YYYY-MM-DDTHH:MM:SS")
+    parser.add_argument("--timezone", type=str, required=True, help="REQUIRED. Timezone of the LSF cluster. LSF timestamps are in local time and will be converted to UTC. Use IANA timezone names (e.g., 'America/Los_Angeles', 'Asia/Kolkata', 'UTC')")
+    parser.add_argument("--starttime", help="Select jobs after the specified time in UTC. Format: YYYY-MM-DDTHH:MM:SS (e.g., 2025-07-05T00:00:00)")
+    parser.add_argument("--endtime", help="Select jobs before the specified time in UTC. Format: YYYY-MM-DDTHH:MM:SS (e.g., 2025-07-06T00:00:00)")
     parser.add_argument("--disable-version-check", action='store_const', const=True, default=False, help="Disable git version check")
     parser.add_argument("--debug", '-d', action='store_const', const=True, default=False, help="Enable debug mode")
     args = parser.parse_args()
@@ -789,7 +817,7 @@ def main() -> None:
     else:
         logger.info(f"LSF logfile directory: {args.logfile_dir}")
 
-    lsfLogParser = LSFLogParser(args.output_csv, args.default_max_mem_gb, logfile_path=args.logfile, logfile_dir=args.logfile_dir, unit_for_limits=args.unit_for_limits, starttime=args.starttime, endtime=args.endtime)
+    lsfLogParser = LSFLogParser(args.output_csv, args.default_max_mem_gb, logfile_path=args.logfile, logfile_dir=args.logfile_dir, unit_for_limits=args.unit_for_limits, starttime=args.starttime, endtime=args.endtime, source_timezone=args.timezone)
     try:
         lsfLogParser.parse_jobs()
     except Exception as e:

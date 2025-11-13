@@ -85,6 +85,9 @@ class SchedulerJobInfo:
 
         # Put resource_request at end because can contain ',' which is also the CSV separator
         resource_request:str='',
+        
+        # Timezone for timestamp conversion (LSF-specific)
+        source_timezone=timezone.utc,
         ):
         '''
         Constructor
@@ -142,9 +145,10 @@ class SchedulerJobInfo:
         self.num_cores = num_cores
         self.max_mem_gb = max_mem_gb
         self.num_hosts = num_hosts
-        (self.submit_time, self.submit_time_dt) = SchedulerJobInfo.fix_datetime(submit_time)
-        (self.start_time, self.start_time_dt) = SchedulerJobInfo.fix_datetime(start_time)
-        (self.finish_time, self.finish_time_dt) = SchedulerJobInfo.fix_datetime(finish_time)
+        self.source_timezone = source_timezone
+        (self.submit_time, self.submit_time_dt) = SchedulerJobInfo.fix_datetime(submit_time, source_timezone)
+        (self.start_time, self.start_time_dt) = SchedulerJobInfo.fix_datetime(start_time, source_timezone)
+        (self.finish_time, self.finish_time_dt) = SchedulerJobInfo.fix_datetime(finish_time, source_timezone)
 
         if not self.submit_time:
             if not SchedulerJobInfo.invalid_submit_time_warning:
@@ -180,7 +184,7 @@ class SchedulerJobInfo:
                 SchedulerJobInfo.invalid_ineligible_pend_time_warning = True
             self.ineligible_pend_time = self.ineligible_pend_time_td = None
         try:
-            (self.eligible_time, self.eligible_time_dt) = SchedulerJobInfo.fix_datetime(eligible_time)
+            (self.eligible_time, self.eligible_time_dt) = SchedulerJobInfo.fix_datetime(eligible_time, source_timezone)
         except:
             logger.warning(f"Invalid eligible_time for job {self.job_id}: {eligible_time}")
             self.eligible_time = self.eligible_time_dt = None
@@ -333,13 +337,15 @@ class SchedulerJobInfo:
         del d['run_time_td']
         del d['ineligible_pend_time_td']
         del d['requeue_time_td']
+        if 'source_timezone' in d:
+            del d['source_timezone']
         return d
 
     def fields(self):
         return self.to_dict().keys()
 
     @staticmethod
-    def fix_datetime(value):
+    def fix_datetime(value, source_timezone=timezone.utc):
         '''
         Check and fix a DateTime passed as an integer or string.
 
@@ -362,12 +368,13 @@ class SchedulerJobInfo:
 
         Args:
             value (int|str): An integer timestamp or string representing a duration.
+            source_timezone (timezone): The timezone in which the timestamp was recorded. Defaults to UTC.
 
         Raises:
             ValueError: If value is not a supported type or value.
 
         Returns:
-            tuple(str, datetime): typle with ISO format DateTime string: `YYYY-MM-DDTHH:MM::SS` and datetime object
+            tuple(str, datetime): typle with ISO format DateTime string: `YYYY-MM-DDTHH:MM::SS` (in UTC) and datetime object (in UTC)
         '''
         if value == None:
             return (None, None)
@@ -377,14 +384,14 @@ class SchedulerJobInfo:
             # LSF provides a value of -1 to mean None. Otherwise seconds since the epoch.
             if value == -1:
                 return (None, None)
-            dt = timestamp_to_datetime(value)
+            dt = timestamp_to_datetime(value, source_timezone)
         elif str(type(value)) == "<class 'str'>":
             if re.match(r'^\s*$', value) or value == '-1':
                 return (None, None)
             # Check if integer passed with wrong type
             try:
                 value = int(value)
-                return SchedulerJobInfo.fix_datetime(value)
+                return SchedulerJobInfo.fix_datetime(value, source_timezone)
             except ValueError:
                 pass
             # SLURM: Make sure it's the right format
@@ -497,24 +504,28 @@ class SchedulerJobInfo:
         return float(value)
 
 
-def timestamp_to_datetime(timestamp) -> datetime:
+def timestamp_to_datetime(timestamp, source_timezone=timezone.utc) -> datetime:
     '''
-    Convert timestamp to a datetime object.
+    Convert timestamp to a datetime object in UTC.
 
     Args:
         timestamp (int or float): Timestamp representing the number of seconds since the epoch.
+        source_timezone (timezone): The timezone in which the timestamp was recorded. Defaults to UTC.
+                                    If timestamp is in local time, pass the local timezone.
 
     Raises:
         ValueError: If timestamp is the wrong type or can't be converted to a datetime object.
 
     Returns:
-        datetime.datetime: The timestamp converted to a datetime object.
+        datetime.datetime: The timestamp converted to a datetime object in UTC timezone.
     '''
     if timestamp == None:
         return timestamp
     if str(type(timestamp)) not in ["<class 'int'>", "<class 'float'>"]:
         raise ValueError(f"Invalid type for timestamp: {timestamp} has type '{type(timestamp)}', expected int or float")
-    return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    # Create datetime in the source timezone, then convert to UTC
+    local_dt = datetime.fromtimestamp(timestamp, tz=source_timezone)
+    return local_dt.astimezone(timezone.utc)
 
 def str_to_datetime(string_value: str) -> datetime:
     '''
