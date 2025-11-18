@@ -85,7 +85,7 @@ class SchedulerJobInfo:
 
         # Put resource_request at end because can contain ',' which is also the CSV separator
         resource_request:str='',
-        
+
         # Timezone for timestamp conversion (LSF-specific)
         source_timezone=timezone.utc,
         ):
@@ -129,8 +129,8 @@ class SchedulerJobInfo:
             ru_msgsnd (int):
             ru_nswap (int):
             ru_oublock (int):
-            ru_stime (int):
-            ru_utime (int):
+            ru_stime (float): System CPU time used in seconds
+            ru_utime (float): User CPU time used in seconds
 
             resource_request (str): Additional resources requested by the job, for example, licenses
 
@@ -218,8 +218,8 @@ class SchedulerJobInfo:
         self.ru_msgsnd = SchedulerJobInfo.fix_int(ru_msgsnd)
         self.ru_nswap = SchedulerJobInfo.fix_int(ru_nswap)
         self.ru_oublock = SchedulerJobInfo.fix_int(ru_oublock)
-        self.ru_stime = SchedulerJobInfo.fix_duration(ru_stime)[0]
-        self.ru_utime = SchedulerJobInfo.fix_duration(ru_utime)[0]
+        self.ru_stime = SchedulerJobInfo.fix_float_or_duration(ru_stime)
+        self.ru_utime = SchedulerJobInfo.fix_float_or_duration(ru_utime)
 
         self.resource_request = resource_request
 
@@ -502,6 +502,52 @@ class SchedulerJobInfo:
         else:
             raise ValueError(f"Invalid type for value: {value} has type '{type(value)}', expected float or str")
         return float(value)
+
+    @staticmethod
+    def fix_float_or_duration(value):
+        '''
+        Fix a float arg that might be in duration format (for backward compatibility with old CSV files).
+
+        This is used for ru_stime and ru_utime which are floats (seconds) in LSF logs,
+        but may have been written as duration strings in older CSV files.
+
+        Args:
+            value (None | str | int | float): Value that should be converted to a float or None.
+                If a duration string like "0:00:01.958586", converts to seconds.
+                If value is -1 or -1.0, returns None.
+
+        Returns:
+            float|None: Returns None if value is None, empty string, or -1 (LSF convention for unavailable data),
+                        otherwise returns seconds as float.
+
+        Note:
+            LSF uses -1 to indicate that a resource usage value is unavailable (e.g., job failed before
+            resource usage could be measured, or the OS doesn't provide that metric).
+        '''
+        if value == None:
+            return None
+        if str(type(value)) == "<class 'float'>":
+            return None if value == -1.0 else value
+        if str(type(value)) == "<class 'int'>":
+            return None if value == -1 else float(value)
+        if str(type(value)) == "<class 'str'>":
+            if value in ['', 'None']:
+                return None
+            # Check if it's a duration string format (contains ':')
+            if ':' in value:
+                # Parse as duration and convert to seconds
+                try:
+                    td = str_to_timedelta(value)
+                    return td.total_seconds()
+                except:
+                    # If parsing fails, try as regular float
+                    pass
+        # Try to convert to float
+        try:
+            result = float(value)
+            return None if result == -1.0 else result
+        except ValueError:
+            raise ValueError(f"Invalid value for ru_stime/ru_utime: {value} (type: {type(value)})")
 
 
 def timestamp_to_datetime(timestamp, source_timezone=timezone.utc) -> datetime:

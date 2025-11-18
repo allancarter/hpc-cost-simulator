@@ -36,7 +36,7 @@ from openpyxl.styles.numbers import FORMAT_CURRENCY_USD_SIMPLE, FORMAT_NUMBER_CO
 from openpyxl.utils import get_column_letter as xl_get_column_letter
 from openpyxl.utils.units import pixels_to_EMU, points_to_pixels
 import operator
-from os import listdir, makedirs, path, remove
+from os import environ, listdir, makedirs, path, remove, open as os_open, close as os_close, write as os_write, O_CREAT, O_EXCL, O_WRONLY
 from os.path import dirname, realpath
 import psutil
 import re
@@ -154,30 +154,30 @@ class JobAnalyzer(JobAnalyzerBase):
     def _load_existing_job_collector(self) -> bool:
         '''
         Load existing job collector data if it exists
-        
+
         This is used when running hourly_stats mode after combine_hourly
         to preserve the job statistics that were already combined.
-        
+
         Returns:
             bool: True if data was loaded, False if file doesn't exist
         '''
         collector_file = path.join(self._output_dir, 'job_collector.json')
-        
+
         if not path.exists(collector_file):
             logger.debug(f"No existing job collector file found at {collector_file}")
             return False
-        
+
         logger.info(f"Loading existing job collector data from {collector_file}")
-        
+
         try:
             with open(collector_file, 'r') as f:
                 loaded_collector = json.load(f)
-            
+
             # Replace the current job collector with the loaded data
             self.job_data_collector = loaded_collector
             logger.info(f"Successfully loaded job collector data")
             return True
-        
+
         except Exception as e:
             logger.error(f"Failed to load job collector from {collector_file}: {e}")
             return False
@@ -217,15 +217,28 @@ class JobAnalyzer(JobAnalyzerBase):
                     job_field_values = {}
                     for i, field_name in enumerate(field_names):
                         job_field_values[field_name] = job_field_values_array[i]
-                    start_time = str_to_datetime(job_field_values['start_time']).timestamp()
-                    job_id = job_field_values['Job id']
-                    num_hosts = int(job_field_values['Num Hosts'])
-                    job_runtime_minutes = float(job_field_values['Runtime (minutes)'])
-                    instance_type = job_field_values['Instance type']
-                    instance_family = job_field_values['Instance Family']
-                    spot_eligible = job_field_values['Spot'] == 'True'
-                    on_demand_rate = float(job_field_values['Hourly Rate'])
-                    total_on_demand_cost = job_field_values['Total Cost']
+
+                    # Parse job fields with error handling
+                    try:
+                        start_time = str_to_datetime(job_field_values['start_time']).timestamp()
+                    except ValueError as e:
+                        logger.error(f"Failed to parse start_time '{job_field_values['start_time']}' in file {hourly_file} (line {line_number}): {e}")
+                        logger.error(f"  Skipping job record: {job_field_values.get('Job id', 'unknown')}")
+                        continue  # Skip this record but continue processing
+
+                    try:
+                        job_id = job_field_values['Job id']
+                        num_hosts = int(job_field_values['Num Hosts'])
+                        job_runtime_minutes = float(job_field_values['Runtime (minutes)'])
+                        instance_type = job_field_values['Instance type']
+                        instance_family = job_field_values['Instance Family']
+                        spot_eligible = job_field_values['Spot'] == 'True'
+                        on_demand_rate = float(job_field_values['Hourly Rate'])
+                        total_on_demand_cost = job_field_values['Total Cost']
+                    except (ValueError, KeyError) as e:
+                        logger.error(f"Failed to parse job fields in file {hourly_file} (line {line_number}): {e}")
+                        logger.error(f"  Job data: {job_field_values}")
+                        continue  # Skip this record but continue processing
 
                     end_time = start_time + job_runtime_minutes * 60
                     total_hourly_rate = on_demand_rate * num_hosts
@@ -282,9 +295,15 @@ class JobAnalyzer(JobAnalyzerBase):
             logger.debug(f"    Finished processing ({num_jobs:,} jobs)")
 	        # Print a progress message for every 24 hours of data
             if hourly_file_index and (hourly_file_index % 24 == 0):
-                memory = psutil.virtual_memory()
+                process = psutil.Process()
+                mem_info = process.memory_info()
+                rss_bytes = mem_info.rss  # Resident Set Size - physical RAM used
+                vms_bytes = mem_info.vms  # Virtual Memory Size - total process memory
+                rss_gb = rss_bytes / (1024**3)
+                vms_gb = vms_bytes / (1024**3)
+                memory_percent = int((rss_bytes / vms_bytes) * 100)
                 try:
-                    logger.info(f"Processed {hourly_file_index + 1} / {len(hourly_files)} ({round((hourly_file_index + 1) / len(hourly_files) * 100)} %) of hourly job files. mem used: {memory.used}/{memory.total}={int(memory.used/memory.total*100)}%")
+                    logger.info(f"Processed {hourly_file_index + 1} / {len(hourly_files)} ({round((hourly_file_index + 1) / len(hourly_files) * 100)} %) of hourly job files. process mem used: {rss_gb:.2f}/{vms_gb:.2f} GB = {memory_percent}%")
                 except:
                     logger.exception()
 
@@ -333,10 +352,10 @@ class JobAnalyzer(JobAnalyzerBase):
         '''
         # Load existing job collector data if it exists (from combine_hourly step)
         self._load_existing_job_collector()
-        
+
         # Write job collector data to summary.csv
         self._dump_job_collector_to_csv()
-        
+
         self._write_hourly_stats_csv()
 
         self._write_hourly_stats_xlsx()
@@ -1279,8 +1298,14 @@ class JobAnalyzer(JobAnalyzerBase):
             self._add_job_to_collector(job)
             self._add_job_to_hourly_bucket(job_cost_data)
             if (total_jobs % 10000) == 0:
-                memory = psutil.virtual_memory()
-                logger.info(f"    Parsed {total_jobs:,} jobs. mem used: {memory.used:,}/{memory.total:,} = {int(memory.used/memory.total*100)}%")
+                process = psutil.Process()
+                mem_info = process.memory_info()
+                rss_bytes = mem_info.rss  # Resident Set Size - physical RAM used
+                vms_bytes = mem_info.vms  # Virtual Memory Size - total process memory
+                rss_gb = rss_bytes / (1024**3)
+                vms_gb = vms_bytes / (1024**3)
+                memory_percent = int((rss_bytes / vms_bytes) * 100)
+                logger.info(f"    Parsed {total_jobs:,} jobs. process mem used: {rss_gb:.2f}/{vms_gb:.2f} GB = {memory_percent}%")
         logger.info(f"Finished processing {total_jobs-total_failed_jobs:,}/{total_jobs:,} jobs")
 
         # Dump pending jobs and summary to output files
@@ -1308,58 +1333,170 @@ class JobAnalyzer(JobAnalyzerBase):
 
         if output_subdir is None:
             output_subdir = path.splitext(path.basename(jobs_csv_file))[0]
-        
-        # Create subdirectory for this batch's hourly files
+
+        # Prepare subdirectory for this batch's hourly files
         batch_hourly_dir = path.join(self._output_dir, 'hourly-files', output_subdir)
-        if not path.exists(batch_hourly_dir):
-            makedirs(batch_hourly_dir)
-        
+        lock_file = path.join(batch_hourly_dir, '.processing.lock')
+
+        # Check if directory exists before we try to create it
+        dir_existed = path.exists(batch_hourly_dir)
+
+        # Ensure directory exists - handle race condition if multiple processes try to create it
+        if not dir_existed:
+            logger.info(f"Creating directory: {batch_hourly_dir}")
+            try:
+                # Ensure parent directory exists
+                hourly_files_base = path.join(self._output_dir, 'hourly-files')
+                if not path.exists(hourly_files_base):
+                    makedirs(hourly_files_base)
+                makedirs(batch_hourly_dir)
+            except FileExistsError:
+                # Another process created it between our check and makedirs - that's fine
+                logger.debug(f"Directory created by another process: {batch_hourly_dir}")
+                dir_existed = True  # Update flag since directory now exists
+
+        # Atomically create lock file - this prevents race conditions
+        # Using O_CREAT|O_EXCL ensures creation fails if file already exists
+        # This is atomic even on NFS v3+ (though NFS v2 had issues)
+        try:
+            lock_fd = os_open(lock_file, O_CREAT | O_EXCL | O_WRONLY, 0o644)
+
+            # Build lock file contents
+            lock_contents = f"Locked at: {datetime.now()}\n"
+            lock_contents += f"Process ID: {psutil.Process().pid}\n"
+            lock_contents += f"Hostname: {environ.get('HOSTNAME', 'unknown')}\n"
+
+            # Check if running under LSF
+            lsf_jobid = environ.get('LSB_JOBID')
+            lsf_jobname = environ.get('LSB_JOBNAME')
+            lsf_batch_jid = environ.get('LSB_BATCH_JID')
+
+            if lsf_jobid or lsf_batch_jid:
+                lock_contents += f"Running under LSF:\n"
+                if lsf_jobid:
+                    lock_contents += f"  LSF Job ID: {lsf_jobid}\n"
+                    logger.info(f"Running as LSF job {lsf_jobid}")
+                if lsf_batch_jid and lsf_batch_jid != lsf_jobid:
+                    lock_contents += f"  LSF Batch Job ID: {lsf_batch_jid}\n"
+                if lsf_jobname:
+                    lock_contents += f"  LSF Job Name: {lsf_jobname}\n"
+            else:
+                lock_contents += f"Not running under LSF\n"
+
+            lock_contents += f"Processing: {jobs_csv_file}\n"
+
+            # Write to file descriptor and close
+            os_write(lock_fd, lock_contents.encode('utf-8'))
+            os_close(lock_fd)
+
+            logger.info(f"Acquired lock: {lock_file}")
+
+        except FileExistsError:
+            # Lock file already exists - another process is using this directory
+            logger.error(f"Lock file already exists: {lock_file}")
+            logger.error(f"Another process is already writing to {batch_hourly_dir}")
+            # Try to read lock file to show who created it
+            try:
+                with open(lock_file, 'r') as f:
+                    lock_contents = f.read()
+                    logger.error(f"Lock file contents:\n{lock_contents}")
+            except:
+                pass
+            logger.error(f"If you're sure no other process is running, remove the lock file manually:")
+            logger.error(f"  rm {lock_file}")
+            raise RuntimeError(f"Directory {batch_hourly_dir} is locked by another process")
+        except Exception as e:
+            logger.error(f"Failed to create lock file {lock_file}: {e}")
+            raise RuntimeError(f"Could not create lock file: {e}")
+
+        # Now that we have the lock, clean up any existing hourly files from previous incomplete runs
+        if dir_existed:
+            existing_hourly_files = []
+            for filename in listdir(batch_hourly_dir):
+                file_path = path.join(batch_hourly_dir, filename)
+                if path.isfile(file_path) and filename.startswith('hourly-') and filename.endswith('.csv'):
+                    existing_hourly_files.append(file_path)
+
+            if existing_hourly_files:
+                logger.warning(f"Found {len(existing_hourly_files)} existing hourly files from previous incomplete run")
+                logger.warning(f"Cleaning up {len(existing_hourly_files)} files...")
+                for file_path in existing_hourly_files:
+                    try:
+                        remove(file_path)
+                        logger.debug(f"  Removed {file_path}")
+                    except Exception as e:
+                        logger.error(f"  Failed to remove {file_path}: {e}")
+                        # Clean up lock file before failing
+                        try:
+                            remove(lock_file)
+                        except:
+                            pass
+                        raise RuntimeError(f"Could not clean up existing files: {e}")
+                logger.info(f"Cleanup complete")
+
         # Temporarily override the hourly files directory
         original_hourly_dir = self._hourly_files_dir
         self._hourly_files_dir = batch_hourly_dir
 
         logger.info(f"Processing {jobs_csv_file} -> {batch_hourly_dir}")
-        
-        # Use CSVLogParser to read the jobs.csv file
-        csv_parser = CSVLogParser(jobs_csv_file, output_csv=None, starttime=self._starttime, endtime=self._endtime)
-        
-        total_jobs = 0
-        total_failed_jobs = 0
-        while True:
-            job = csv_parser.parse_job()
-            if not job:
-                break
-            if not self._filter_job_queue(job):
-                continue
-            if not self._filter_job_project(job):
-                continue
-            total_jobs += 1
-            
+
+        try:
+            # Use CSVLogParser to read the jobs.csv file
+            csv_parser = CSVLogParser(jobs_csv_file, output_csv=None, starttime=self._starttime, endtime=self._endtime)
+
+            total_jobs = 0
+            total_failed_jobs = 0
+            while True:
+                job = csv_parser.parse_job()
+                if not job:
+                    break
+                if not self._filter_job_queue(job):
+                    continue
+                if not self._filter_job_project(job):
+                    continue
+                total_jobs += 1
+
+                try:
+                    job_cost_data = self.analyze_job(job)
+                except RuntimeError as e:
+                    total_failed_jobs += 1
+                    logger.error(f"{e}")
+                    continue
+
+                # Add job to collector for job statistics (counts, durations, wait times)
+                self._add_job_to_collector(job)
+                self._add_job_to_hourly_bucket(job_cost_data)
+
+                if (total_jobs % 10000) == 0:
+                    process = psutil.Process()
+                    mem_info = process.memory_info()
+                    rss_bytes = mem_info.rss  # Resident Set Size - physical RAM used
+                    vms_bytes = mem_info.vms  # Virtual Memory Size - total process memory
+                    rss_gb = rss_bytes / (1024**3)
+                    vms_gb = vms_bytes / (1024**3)
+                    memory_percent = int((rss_bytes / vms_bytes) * 100)
+                    logger.info(f"    {jobs_csv_file}: Parsed {total_jobs:,} jobs. process mem used: {rss_gb:.2f}/{vms_gb:.2f} GB = {memory_percent}%")
+
+            # Write any remaining jobs in buckets
+            self._write_hourly_jobs_buckets_to_file()
+
+            # Save job collector data for this batch as JSON
+            self._save_batch_job_collector(batch_hourly_dir)
+
+            logger.info(f"Finished processing {jobs_csv_file}: {total_jobs-total_failed_jobs:,}/{total_jobs:,} jobs")
+
+        finally:
+            # Always restore original hourly directory
+            self._hourly_files_dir = original_hourly_dir
+
+            # Always remove lock file when done (success or failure)
             try:
-                job_cost_data = self.analyze_job(job)
-            except RuntimeError as e:
-                total_failed_jobs += 1
-                logger.error(f"{e}")
-                continue
-            
-            # Add job to collector for job statistics (counts, durations, wait times)
-            self._add_job_to_collector(job)
-            self._add_job_to_hourly_bucket(job_cost_data)
-            
-            if (total_jobs % 10000) == 0:
-                memory = psutil.virtual_memory()
-                logger.info(f"    {jobs_csv_file}: Parsed {total_jobs:,} jobs. mem used: {memory.used:,}/{memory.total:,} = {int(memory.used/memory.total*100)}%")
-        
-        # Write any remaining jobs in buckets
-        self._write_hourly_jobs_buckets_to_file()
-        
-        # Save job collector data for this batch as JSON
-        self._save_batch_job_collector(batch_hourly_dir)
-        
-        logger.info(f"Finished processing {jobs_csv_file}: {total_jobs-total_failed_jobs:,}/{total_jobs:,} jobs")
-        
-        # Restore original hourly directory
-        self._hourly_files_dir = original_hourly_dir
+                if path.exists(lock_file):
+                    remove(lock_file)
+                    logger.info(f"Removed lock file: {lock_file}")
+            except Exception as e:
+                logger.error(f"Failed to remove lock file {lock_file}: {e}")
+                logger.error(f"You may need to remove it manually: rm {lock_file}")
 
     def _save_batch_job_collector(self, batch_dir: str) -> None:
         '''
@@ -1370,10 +1507,10 @@ class JobAnalyzer(JobAnalyzerBase):
         '''
         collector_file = path.join(batch_dir, 'job_collector.json')
         logger.info(f"Saving job collector data to {collector_file}")
-        
+
         with open(collector_file, 'w') as f:
             json.dump(self.job_data_collector, f, indent=2)
-    
+
     def _combine_job_collectors(self, batch_subdirs: list) -> None:
         '''
         Combine job_data_collector data from multiple batch subdirectories
@@ -1385,36 +1522,36 @@ class JobAnalyzer(JobAnalyzerBase):
             batch_subdirs (list): List of subdirectory names containing job_collector.json files
         '''
         logger.info(f"Combining job collector data from {len(batch_subdirs)} batches")
-        
+
         # Clear the current job collector
         self._clear_job_stats()
-        
+
         hourly_files_base = path.join(self._output_dir, 'hourly-files')
-        
+
         for subdir in batch_subdirs:
             collector_file = path.join(hourly_files_base, subdir, 'job_collector.json')
-            
+
             if not path.exists(collector_file):
                 logger.warning(f"Job collector file not found: {collector_file}, skipping")
                 continue
-            
+
             logger.debug(f"Loading job collector from {collector_file}")
-            
+
             try:
                 with open(collector_file, 'r') as f:
                     batch_collector = json.load(f)
-                
+
                 # Merge the batch collector into the main collector
                 for ram_range, runtime_dict in batch_collector.items():
                     for runtime_range, stats in runtime_dict.items():
                         self.job_data_collector[ram_range][runtime_range]['number_of_jobs'] += stats['number_of_jobs']
                         self.job_data_collector[ram_range][runtime_range]['total_duration_minutes'] += stats['total_duration_minutes']
                         self.job_data_collector[ram_range][runtime_range]['total_wait_minutes'] += stats['total_wait_minutes']
-            
+
             except Exception as e:
                 logger.error(f"Failed to load/merge job collector from {collector_file}: {e}")
                 continue
-        
+
         logger.info(f"Successfully combined job collector data from {len(batch_subdirs)} batches")
 
     def combine_hourly_files(self, batch_subdirs: list = None) -> None:
@@ -1430,7 +1567,34 @@ class JobAnalyzer(JobAnalyzerBase):
                                 If None, auto-discovers all subdirectories.
         '''
         hourly_files_base = path.join(self._output_dir, 'hourly-files')
-        
+
+        # Delete any existing combined hourly files from previous runs
+        logger.info(f"Cleaning up old combined hourly files in {hourly_files_base}")
+        existing_hourly_files = []
+        for filename in listdir(hourly_files_base):
+            file_path = path.join(hourly_files_base, filename)
+            # Only delete hourly-*.csv files, not subdirectories
+            if path.isfile(file_path) and filename.startswith('hourly-') and filename.endswith('.csv'):
+                existing_hourly_files.append(file_path)
+
+        if existing_hourly_files:
+            logger.info(f"  Removing {len(existing_hourly_files)} existing combined hourly files from previous runs")
+            for file_path in existing_hourly_files:
+                try:
+                    remove(file_path)
+                    logger.debug(f"    Removed {file_path}")
+                except Exception as e:
+                    # Check if file still exists - if so, this is a real error
+                    if path.exists(file_path):
+                        logger.error(f"    FATAL: Failed to remove {file_path}: {e}")
+                        logger.error(f"    Cannot proceed with old data present. Aborting.")
+                        raise RuntimeError(f"Failed to remove existing hourly file {file_path}: {e}")
+                    else:
+                        # File doesn't exist anymore, probably deleted by another process
+                        logger.debug(f"    {file_path} already removed by another process")
+        else:
+            logger.info(f"  No existing combined hourly files to remove")
+
         if batch_subdirs is None:
             # Auto-discover subdirectories
             batch_subdirs = []
@@ -1438,18 +1602,18 @@ class JobAnalyzer(JobAnalyzerBase):
                 item_path = path.join(hourly_files_base, item)
                 if path.isdir(item_path):
                     batch_subdirs.append(item)
-        
+
         logger.info(f"Combining hourly files from {len(batch_subdirs)} subdirectories")
-        
+
         # Collect all hourly files organized by hour
         hourly_data_by_hour = {}  # hour -> list of file paths
-        
+
         for subdir in batch_subdirs:
             subdir_path = path.join(hourly_files_base, subdir)
             if not path.isdir(subdir_path):
                 logger.warning(f"Skipping {subdir_path} - not a directory")
                 continue
-            
+
             logger.info(f"  Processing subdirectory: {subdir}")
             for filename in listdir(subdir_path):
                 if filename.startswith('hourly-') and filename.endswith('.csv'):
@@ -1460,25 +1624,25 @@ class JobAnalyzer(JobAnalyzerBase):
                     except ValueError:
                         logger.warning(f"    Skipping invalid filename: {filename}")
                         continue
-                    
+
                     file_path = path.join(subdir_path, filename)
                     if hour not in hourly_data_by_hour:
                         hourly_data_by_hour[hour] = []
                     hourly_data_by_hour[hour].append(file_path)
-        
+
         logger.info(f"Found data for {len(hourly_data_by_hour)} unique hours")
-        
+
         # Combine files for each hour
         for hour in sorted(hourly_data_by_hour.keys()):
             combined_file = path.join(hourly_files_base, f"hourly-{hour}.csv")
             source_files = hourly_data_by_hour[hour]
-            
+
             logger.debug(f"  Combining hour {hour} from {len(source_files)} files")
-            
+
             with open(combined_file, 'w') as combined_fh:
                 # Write header
                 combined_fh.write('start_time,Job id,Num Hosts,Runtime (minutes),memory (GB),Wait time (minutes),Instance type,Instance Family,Spot,Hourly Rate,Total Cost\n')
-                
+
                 # Append data from all source files
                 for source_file in source_files:
                     with open(source_file, 'r') as source_fh:
@@ -1487,18 +1651,18 @@ class JobAnalyzer(JobAnalyzerBase):
                         if lines and lines[0].startswith('start_time'):
                             lines = lines[1:]
                         combined_fh.writelines(lines)
-        
+
         logger.info(f"Successfully combined hourly files into {hourly_files_base}")
-        
+
         # Combine job collector data from all batches
         self._combine_job_collectors(batch_subdirs)
-        
+
         # Save the combined job collector as JSON in the main output directory
         combined_collector_file = path.join(self._output_dir, 'job_collector.json')
         logger.info(f"Saving combined job collector to {combined_collector_file}")
         with open(combined_collector_file, 'w') as f:
             json.dump(self.job_data_collector, f, indent=2)
-        
+
         # Write combined job collector to CSV
         self._dump_job_collector_to_csv()
         logger.info(f"Successfully combined and saved job statistics")
@@ -1507,27 +1671,27 @@ class JobAnalyzer(JobAnalyzerBase):
     def _process_single_csv_worker(args):
         '''
         Worker function for parallel processing of jobs.csv files
-        
+
         This is a static method that can be called by multiprocessing.Pool
-        
+
         Args:
-            args: Tuple of (jobs_csv_file, config_filename, output_dir, starttime, endtime, 
+            args: Tuple of (jobs_csv_file, config_filename, output_dir, starttime, endtime,
                            queue_filters, project_filters, output_subdir)
-        
+
         Returns:
             Tuple of (jobs_csv_file, success, message)
         '''
-        (jobs_csv_file, config_filename, output_dir, starttime, endtime, 
+        (jobs_csv_file, config_filename, output_dir, starttime, endtime,
          queue_filters, project_filters, output_subdir) = args
-        
+
         try:
             # Create a new JobAnalyzer instance for this worker
             # Note: We use None as scheduler_parser since we're reading from CSV
-            job_analyzer = JobAnalyzer(None, config_filename, output_dir, starttime, 
+            job_analyzer = JobAnalyzer(None, config_filename, output_dir, starttime,
                                       endtime, queue_filters, project_filters)
-            
+
             job_analyzer.process_jobs_csv_to_hourly(jobs_csv_file, output_subdir)
-            
+
             return (jobs_csv_file, True, "Success")
         except Exception as e:
             logger.exception(f"Error processing {jobs_csv_file}")
@@ -1543,36 +1707,36 @@ class JobAnalyzer(JobAnalyzerBase):
         '''
         if num_processes is None:
             num_processes = cpu_count()
-        
+
         logger.info(f"Processing {len(jobs_csv_files)} jobs.csv files using {num_processes} processes")
-        
+
         # Prepare arguments for each worker
         worker_args = []
         for idx, jobs_csv_file in enumerate(jobs_csv_files):
             output_subdir = f"batch_{idx:04d}_{path.splitext(path.basename(jobs_csv_file))[0]}"
-            args = (jobs_csv_file, self._config_filename, self._output_dir, 
-                   self._starttime, self._endtime, self._queue_filters, 
+            args = (jobs_csv_file, self._config_filename, self._output_dir,
+                   self._starttime, self._endtime, self._queue_filters,
                    self._project_filters, output_subdir)
             worker_args.append(args)
-        
+
         # Process in parallel
         with Pool(processes=num_processes) as pool:
             results = pool.map(JobAnalyzer._process_single_csv_worker, worker_args)
-        
+
         # Report results
         successes = sum(1 for _, success, _ in results if success)
         failures = len(results) - successes
-        
+
         logger.info(f"Parallel processing complete: {successes} succeeded, {failures} failed")
-        
+
         if failures > 0:
             logger.warning("Failed files:")
             for csv_file, success, message in results:
                 if not success:
                     logger.warning(f"  {csv_file}: {message}")
-        
+
         # Now combine all the hourly files
-        batch_subdirs = [f"batch_{idx:04d}_{path.splitext(path.basename(f))[0]}" 
+        batch_subdirs = [f"batch_{idx:04d}_{path.splitext(path.basename(f))[0]}"
                         for idx, f in enumerate(jobs_csv_files)]
         self.combine_hourly_files(batch_subdirs)
 
@@ -1780,16 +1944,16 @@ def main():
             logger.info(f"Processing multiple jobs.csv files in parallel from {args.jobs_csv_dir}")
             scheduler_parser = None
             jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects)
-            
+
             # Find all matching CSV files
             csv_files = glob_files(path.join(args.jobs_csv_dir, args.jobs_csv_pattern))
             if not csv_files:
                 logger.error(f"No CSV files found matching pattern {args.jobs_csv_pattern} in {args.jobs_csv_dir}")
                 exit(1)
-            
+
             logger.info(f"Found {len(csv_files)} CSV files to process")
             jobAnalyzer.process_jobs_csv_parallel(csv_files, args.num_processes)
-            
+
             # After combining, process the hourly files and generate statistics
             logger.info("Processing combined hourly files to generate statistics")
             jobAnalyzer._process_hourly_jobs()
