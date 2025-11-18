@@ -229,7 +229,7 @@ class LzBz2TextWrapper:
 
 class LSFLogParser(SchedulerLogParser):
     '''
-    Parse LSF bacct.lsb* files to get job completion information.
+    Parse LSF lsb.acct* files to get job completion information.
     '''
 
     def __init__(self, output_csv: str, default_max_mem_gb: float, logfile_path: str=None, logfile_dir: str=None, unit_for_limits: str='MB', starttime: str=None, endtime: str=None, source_timezone: str=None):
@@ -519,7 +519,7 @@ class LSFLogParser(SchedulerLogParser):
 
     def _parse_record_fields(self, original_fields, record_format: dict) -> dict:
         '''
-        Parse a line from the bacct.lsb* file and return the field values.
+        Parse a line from the lsb.acct* file and return the field values.
 
         Args:
             record_line (str): The line from the logfile.
@@ -543,7 +543,7 @@ class LSFLogParser(SchedulerLogParser):
             }
             record['record_type'] = record_type
 
-            if not(record_format[record_type] or record_format[record_type]['fields']):
+            if not record_format[record_type] or not record_format[record_type].get('fields'):
                 # For record types that haven't been implemented yet just capture the raw fields
                 record['raw_fields'] = fields
                 return record
