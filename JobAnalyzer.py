@@ -1315,6 +1315,12 @@ class JobAnalyzer(JobAnalyzerBase):
         self._process_hourly_jobs()
         self._write_hourly_stats()
 
+        # Check if there were any parsing errors
+        if self._scheduler_parser._num_errors > 0:
+            error_msg = f"Encountered {self._scheduler_parser._num_errors} parsing error(s)"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
     def process_jobs_csv_to_hourly(self, jobs_csv_file: str, output_subdir: str = None) -> None:
         '''
         Process a single jobs.csv file and create hourly bucket files
@@ -1497,6 +1503,14 @@ class JobAnalyzer(JobAnalyzerBase):
             except Exception as e:
                 logger.error(f"Failed to remove lock file {lock_file}: {e}")
                 logger.error(f"You may need to remove it manually: rm {lock_file}")
+                raise RuntimeError(f"Failed to remove lock file {lock_file}: {e}")
+
+        # Check if there were any parsing errors (after cleanup completes)
+        if csv_parser._num_errors > 0:
+            error_msg = f"Encountered {csv_parser._num_errors} parsing error(s) in {jobs_csv_file}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
 
     def _save_batch_job_collector(self, batch_dir: str) -> None:
         '''
@@ -1730,10 +1744,11 @@ class JobAnalyzer(JobAnalyzerBase):
         logger.info(f"Parallel processing complete: {successes} succeeded, {failures} failed")
 
         if failures > 0:
-            logger.warning("Failed files:")
+            logger.error("Failed files:")
             for csv_file, success, message in results:
                 if not success:
-                    logger.warning(f"  {csv_file}: {message}")
+                    logger.error(f"  {csv_file}: {message}")
+            raise RuntimeError(f"Failed to process {failures} CSV file(s). See errors above for details.")
 
         # Now combine all the hourly files
         batch_subdirs = [f"batch_{idx:04d}_{path.splitext(path.basename(f))[0]}"

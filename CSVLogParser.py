@@ -61,6 +61,7 @@ class CSVLogParser(SchedulerLogParser):
             try:
                 job = self._read_job_from_csv()
             except ValueError:
+                # Error already logged, continue processing but error count incremented in SchedulerLogParser._read_job_from_csv().
                 continue
             if not job:
                 return job
