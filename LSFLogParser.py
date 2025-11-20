@@ -244,7 +244,7 @@ class LSFLogParser(SchedulerLogParser):
             unit_for_limits (str): Unit for job memory limits (KB, MB, GB, TB, PB, EB)
             starttime (str): Select jobs after the specified time
             endtime (str): Select jobs after the specified time
-            source_timezone (str): REQUIRED. Timezone of the LSF cluster (e.g., 'America/Los_Angeles', 'Asia/Kolkata', 'UTC'). 
+            source_timezone (str): REQUIRED. Timezone of the LSF cluster (e.g., 'America/Los_Angeles', 'Asia/Kolkata', 'UTC').
                                    LSF timestamps are in local time and will be converted to UTC.
         '''
         super().__init__(None, output_csv, starttime, endtime)
@@ -259,7 +259,7 @@ class LSFLogParser(SchedulerLogParser):
         if not source_timezone:
             raise ValueError("--timezone is required. LSF timestamps are in local time and must be converted to UTC. "
                            "Specify the timezone of your LSF cluster (e.g., 'America/Los_Angeles', 'Asia/Kolkata', 'UTC')")
-        
+
         # Parse and store the source timezone
         try:
             if source_timezone.upper() == 'UTC':
@@ -345,6 +345,11 @@ class LSFLogParser(SchedulerLogParser):
             except UnicodeDecodeError as e:
                 self._lsb_acct_line_number += 1
                 self._save_invalid_record(self._lsb_acct_filename, self._lsb_acct_line_number, str(e), '')
+                continue
+            except csv.Error as e:
+                self._lsb_acct_line_number += 1
+                self._save_invalid_record(self._lsb_acct_filename, self._lsb_acct_line_number, f"CSV Error: {str(e)}", '')
+                logger.warning(f"{self._lsb_acct_filename}, line {self._lsb_acct_line_number}: CSV parsing error: {e}")
                 continue
             except StopIteration:
                 logger.debug(f"Reached EOF of {self._lsb_acct_filename}")
