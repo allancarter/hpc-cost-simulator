@@ -47,6 +47,7 @@ config_schema = Schema(
             'compute_savings_plan_duration': And(Use(int), lambda n: n in [1, 3]),
             'compute_savings_plan_payment_option': And(str, lambda s: s in ['All Upfront', 'Partial Upfront', 'No Upfront']),
             Optional('job_file_batch_size', default=1000): int,
+            Optional('use_rss_for_instance_selection', default=False): bool,
         },
         Optional('Jobs', default={'QueueRegExps': [], 'ProjectRegExps': []}): {
             Optional('QueueRegExps', default=[]): [

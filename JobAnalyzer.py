@@ -59,7 +59,7 @@ class JobCost:
 
 class JobAnalyzer(JobAnalyzerBase):
 
-    def __init__(self, scheduler_parser: SchedulerLogParser, config_filename: str, output_dir: str, starttime: str, endtime: str, queue_filters: str, project_filters: str) -> None:
+    def __init__(self, scheduler_parser: SchedulerLogParser, config_filename: str, output_dir: str, starttime: str, endtime: str, queue_filters: str, project_filters: str, use_rss: bool = None) -> None:
         '''
         Constructor
 
@@ -71,10 +71,19 @@ class JobAnalyzer(JobAnalyzerBase):
             endtime (str): Select jobs after the specified time
             queue_filters (str): Queue filters
             project_filters (str): Project filters
+            use_rss (bool): If True, use RSS (actual memory used) instead of requested memory for instance selection.
+                           If None, use the value from the config file. Command line option overrides config file.
         Returns:
             None
         '''
         super().__init__(scheduler_parser, config_filename, output_dir, starttime, endtime, queue_filters, project_filters)
+        # Command line option overrides config file setting
+        if use_rss is not None:
+            self._use_rss = use_rss
+        else:
+            self._use_rss = self.config['consumption_model_mapping']['use_rss_for_instance_selection']
+        if self._use_rss:
+            logger.info("Using RSS (actual memory used) for instance selection instead of requested memory")
 
     def get_hourly_files(self):
         '''
@@ -1690,19 +1699,19 @@ class JobAnalyzer(JobAnalyzerBase):
 
         Args:
             args: Tuple of (jobs_csv_file, config_filename, output_dir, starttime, endtime,
-                           queue_filters, project_filters, output_subdir)
+                           queue_filters, project_filters, output_subdir, use_rss)
 
         Returns:
             Tuple of (jobs_csv_file, success, message)
         '''
         (jobs_csv_file, config_filename, output_dir, starttime, endtime,
-         queue_filters, project_filters, output_subdir) = args
+         queue_filters, project_filters, output_subdir, use_rss) = args
 
         try:
             # Create a new JobAnalyzer instance for this worker
             # Note: We use None as scheduler_parser since we're reading from CSV
             job_analyzer = JobAnalyzer(None, config_filename, output_dir, starttime,
-                                      endtime, queue_filters, project_filters)
+                                      endtime, queue_filters, project_filters, use_rss=use_rss)
 
             job_analyzer.process_jobs_csv_to_hourly(jobs_csv_file, output_subdir)
 
@@ -1730,7 +1739,7 @@ class JobAnalyzer(JobAnalyzerBase):
             output_subdir = f"batch_{idx:04d}_{path.splitext(path.basename(jobs_csv_file))[0]}"
             args = (jobs_csv_file, self._config_filename, self._output_dir,
                    self._starttime, self._endtime, self._queue_filters,
-                   self._project_filters, output_subdir)
+                   self._project_filters, output_subdir, self._use_rss)
             worker_args.append(args)
 
         # Process in parallel
@@ -1808,7 +1817,14 @@ class JobAnalyzer(JobAnalyzerBase):
         '''
         # Find the right instance type to run the job + its price
         num_hosts = job.num_hosts
-        min_memory_per_instance = ceil(job.max_mem_gb / num_hosts)
+        # Use RSS (actual memory used) if enabled and available, otherwise use requested memory
+        if self._use_rss and job.ru_maxrss is not None:
+            # ru_maxrss is in KB, convert to GB
+            mem_gb = job.ru_maxrss / (1024 * 1024)
+            logger.debug(f"Job {job.job_id}: Using RSS {mem_gb:.2f} GB instead of requested {job.max_mem_gb:.2f} GB")
+        else:
+            mem_gb = job.max_mem_gb
+        min_memory_per_instance = ceil(mem_gb / num_hosts)
         num_cores_per_instance = ceil(job.num_cores / num_hosts)
         potential_instance_types = self.get_instance_by_spec(min_memory_per_instance, num_cores_per_instance, self.minimum_cpu_speed)
         if len(potential_instance_types) == 0:
@@ -1886,6 +1902,8 @@ def main():
         parser.add_argument("--disable-version-check", action='store_const', const=True, default=False, help="Disable git version check")
 
         parser.add_argument("--debug", '-d', action='store_const', const=True, default=False, help="Enable debug mode")
+
+        parser.add_argument("--use-rss", action='store_const', const=True, default=None, help="Use RSS (actual memory used) instead of requested memory for instance selection. This helps understand the cost impact of over-requesting memory. Overrides config file setting.")
         args = parser.parse_args()
 
         # Configure logfile
@@ -1941,24 +1959,24 @@ def main():
         elif args.parser == 'hourly_stats':
             logger.info(f"Parsing hourly jobs from {args.output_dir}/hourly-files/hourly-*.csv")
             scheduler_parser = None
-            jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects)
+            jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects, use_rss=args.use_rss)
             jobAnalyzer._process_hourly_jobs()
             jobAnalyzer._write_hourly_stats()
         elif args.parser == 'hourly_stats_csv':
             logger.info(f"Parsing {args.output_dir}/hourly_stats.csv")
             scheduler_parser = None
-            jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects)
+            jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects, use_rss=args.use_rss)
             jobAnalyzer.parse_hourly_stats_csv(args.input_hourly_stats_csv)
             jobAnalyzer._write_hourly_stats()
         elif args.parser == 'process_jobs_csv':
             logger.info(f"Processing single jobs.csv file: {args.input_jobs_csv}")
             scheduler_parser = None
-            jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects)
+            jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects, use_rss=args.use_rss)
             jobAnalyzer.process_jobs_csv_to_hourly(args.input_jobs_csv, args.output_subdir)
         elif args.parser == 'parallel_jobs_csv':
             logger.info(f"Processing multiple jobs.csv files in parallel from {args.jobs_csv_dir}")
             scheduler_parser = None
-            jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects)
+            jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects, use_rss=args.use_rss)
 
             # Find all matching CSV files
             csv_files = glob_files(path.join(args.jobs_csv_dir, args.jobs_csv_pattern))
@@ -1976,14 +1994,14 @@ def main():
         elif args.parser == 'combine_hourly':
             logger.info(f"Combining hourly files from subdirectories")
             scheduler_parser = None
-            jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects)
+            jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects, use_rss=args.use_rss)
             jobAnalyzer.combine_hourly_files(args.batch_subdirs)
 
         if scheduler_parser:
             if args.output_csv:
                 logger.info(f"Writing job data to {args.output_csv}")
 
-            jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects)
+            jobAnalyzer = JobAnalyzer(scheduler_parser, args.config, args.output_dir, args.starttime, args.endtime, queue_filters=args.queues, project_filters=args.projects, use_rss=args.use_rss)
 
             # Print out configuration information
             logger.info(f"""Configuration:
