@@ -23,6 +23,9 @@ from LSB_ACCT_FIELDS import LSB_ACCT_RECORD_FORMATS, MINIMAL_LSB_ACCT_FIELDS
 from MemoryUtils import MEM_GB, MEM_KB, MEM_MB, MEM_TB, MEM_PB, MEM_EB
 from os import listdir, path
 from os.path import basename, dirname, realpath
+import socket
+import subprocess
+import time
 from packaging.version import parse as parse_version
 import re
 from SchedulerJobInfo import SchedulerJobInfo, logger as SchedulerJobInfo_logger
@@ -458,35 +461,216 @@ class LSFLogParser(SchedulerLogParser):
             else:
                 self.total_jobs_outside_time_window += 1
 
-    def _open_log_file(self, logfile_path: str):
+    def _open_log_file(self, logfile_path: str, max_retries: int = 3, retry_delay: float = 2.0):
         '''
         Open a log file, with support for decompressing .bz2, .lz, and .lz.bz2 files on the fly.
 
+        Resolves symlinks before checking existence to help trigger automounts.
+        Includes retry logic and detailed diagnostics on failure.
+
         Args:
             logfile_path (str): Path to the log file.
+            max_retries (int): Number of times to retry if file not found (default 3).
+            retry_delay (float): Seconds to wait between retries (default 2.0).
         Returns:
             file object: File handle for reading
         '''
-        if not path.exists(logfile_path):
-            logger.error(f"Input file doesn't exist: {logfile_path}")
+        # Resolve symlinks to get the real path - this can help trigger automounts
+        resolved_path = realpath(logfile_path)
+        if resolved_path != logfile_path:
+            logger.info(f"Resolved symlink: {logfile_path} -> {resolved_path}")
+
+        # Use the resolved path for existence checks and opening
+        file_to_open = resolved_path
+
+        # Try to access the file with retries
+        last_error = None
+        for attempt in range(max_retries + 1):
+            if path.exists(file_to_open):
+                break
+            if attempt < max_retries:
+                logger.warning(f"File not found (attempt {attempt + 1}/{max_retries + 1}), retrying in {retry_delay}s: {file_to_open}")
+                time.sleep(retry_delay)
+            else:
+                last_error = f"Input file doesn't exist after {max_retries + 1} attempts"
+
+        if last_error:
+            # File still doesn't exist - gather diagnostic information
+            self._log_file_diagnostics(logfile_path, resolved_path)
+            logger.error(f"{last_error}: {file_to_open}")
             exit(1)
 
         # Check for double compression first (.lz.bz2)
         if logfile_path.endswith('.lz.bz2'):
             logger.info(f"Decompressing .lz.bz2 file (double compressed)")
             # Use a custom wrapper to handle double decompression
-            return LzBz2TextWrapper(logfile_path, errors='replace')
+            return LzBz2TextWrapper(file_to_open, errors='replace')
         elif logfile_path.endswith('.bz2'):
             logger.info(f"Decompressing .bz2 file using bz2 module")
             # Use Python's built-in bz2 module to decompress on the fly
-            return bz2.open(logfile_path, 'rt', errors='replace')
+            return bz2.open(file_to_open, 'rt', errors='replace')
         elif logfile_path.endswith('.lz'):
             logger.info(f"Decompressing .lz file using lzip module")
             # Use lzip module wrapper to decompress
-            return LzipTextWrapper(logfile_path, errors='replace')
+            return LzipTextWrapper(file_to_open, errors='replace')
         else:
             # Regular uncompressed file
-            return open(logfile_path, 'r', errors='replace')
+            return open(file_to_open, 'r', errors='replace')
+
+    def _log_file_diagnostics(self, original_path: str, resolved_path: str) -> None:
+        '''
+        Log detailed diagnostic information when a file cannot be found.
+
+        Args:
+            original_path (str): The original path provided by the user.
+            resolved_path (str): The path after resolving symlinks.
+        '''
+        logger.error("=" * 60)
+        logger.error("FILE NOT FOUND - DIAGNOSTIC INFORMATION")
+        logger.error("=" * 60)
+
+        # Basic info
+        try:
+            hostname = socket.gethostname()
+            logger.error(f"Hostname: {hostname}")
+        except Exception as e:
+            logger.error(f"Hostname: Unable to determine ({e})")
+
+        logger.error(f"Original path: {original_path}")
+        logger.error(f"Resolved path: {resolved_path}")
+
+        # Check each component of the original path
+        logger.error("-" * 40)
+        logger.error("Original path component analysis:")
+        path_parts = original_path.split('/')
+        current_path = ''
+        for part in path_parts:
+            if not part:
+                current_path = '/'
+                continue
+            current_path = path.join(current_path, part)
+            exists = path.exists(current_path)
+            is_link = path.islink(current_path)
+            link_target = ''
+            if is_link:
+                try:
+                    link_target = f" -> {realpath(current_path)}"
+                except Exception:
+                    link_target = " -> (unresolvable)"
+            status = "EXISTS" if exists else "MISSING"
+            link_info = " (symlink)" if is_link else ""
+            logger.error(f"  {current_path}: {status}{link_info}{link_target}")
+            if not exists:
+                break
+
+        # Check each component of the resolved path (if different from original)
+        if resolved_path != original_path:
+            logger.error("-" * 40)
+            logger.error("Resolved path component analysis:")
+            path_parts = resolved_path.split('/')
+            current_path = ''
+            for part in path_parts:
+                if not part:
+                    current_path = '/'
+                    continue
+                current_path = path.join(current_path, part)
+                exists = path.exists(current_path)
+                is_link = path.islink(current_path)
+                link_target = ''
+                if is_link:
+                    try:
+                        link_target = f" -> {realpath(current_path)}"
+                    except Exception:
+                        link_target = " -> (unresolvable)"
+                status = "EXISTS" if exists else "MISSING"
+                link_info = " (symlink)" if is_link else ""
+                logger.error(f"  {current_path}: {status}{link_info}{link_target}")
+                if not exists:
+                    break
+
+        # Check parent directory
+        parent_dir = dirname(resolved_path)
+        logger.error("-" * 40)
+        logger.error(f"Parent directory: {parent_dir}")
+        if path.exists(parent_dir):
+            logger.error(f"  Parent exists: YES")
+            try:
+                contents = listdir(parent_dir)
+                logger.error(f"  Parent contains {len(contents)} entries")
+                # Show a sample of files if there are many
+                if len(contents) <= 10:
+                    for f in sorted(contents):
+                        logger.error(f"    - {f}")
+                else:
+                    for f in sorted(contents)[:5]:
+                        logger.error(f"    - {f}")
+                    logger.error(f"    ... and {len(contents) - 5} more")
+            except PermissionError:
+                logger.error(f"  Parent directory listing: PERMISSION DENIED")
+            except Exception as e:
+                logger.error(f"  Parent directory listing failed: {e}")
+        else:
+            logger.error(f"  Parent exists: NO")
+
+        # Check mount status for key paths extracted from both original and resolved paths
+        logger.error("-" * 40)
+        logger.error("Mount point status for relevant paths:")
+        self._check_mount_points(original_path, resolved_path)
+
+        logger.error("=" * 60)
+
+    def _check_mount_points(self, original_path: str, resolved_path: str) -> None:
+        '''
+        Check mount status for key directory paths extracted from the file paths.
+
+        Args:
+            original_path (str): The original path provided by the user.
+            resolved_path (str): The path after resolving symlinks.
+        '''
+        # Extract unique directory prefixes to check (up to depth 4, e.g., /home/lsf_archive/lsf_logs)
+        paths_to_check = set()
+
+        for file_path in [original_path, resolved_path]:
+            parts = file_path.split('/')
+            # Build paths at depth 2, 3, and 4 (e.g., /home/foo, /home/foo/bar, /home/foo/bar/baz)
+            for depth in range(2, min(5, len(parts))):
+                check_path = '/'.join(parts[:depth + 1])
+                if check_path and check_path != '/':
+                    paths_to_check.add(check_path)
+
+        # Parse current mounts from /proc/mounts (more reliable than mount command)
+        current_mounts = {}
+        try:
+            with open('/proc/mounts', 'r') as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        device, mount_point, fs_type = parts[0], parts[1], parts[2]
+                        current_mounts[mount_point] = {'device': device, 'fs_type': fs_type}
+        except Exception as e:
+            logger.error(f"  Unable to read /proc/mounts: {e}")
+            return
+
+        # Check each path and report mount status
+        for check_path in sorted(paths_to_check):
+            exists = path.exists(check_path)
+            is_mount = check_path in current_mounts
+
+            if is_mount:
+                mount_info = current_mounts[check_path]
+                status = f"MOUNTED ({mount_info['fs_type']}: {mount_info['device'][:50]})"
+            elif exists:
+                # Find which mount point this path is under
+                parent_mount = '/'
+                for mp in current_mounts:
+                    if check_path.startswith(mp + '/') or check_path == mp:
+                        if len(mp) > len(parent_mount):
+                            parent_mount = mp
+                status = f"EXISTS (under mount: {parent_mount})"
+            else:
+                status = "NOT ACCESSIBLE"
+
+            logger.error(f"  {check_path}: {status}")
 
     def _close_log_file(self):
         '''
